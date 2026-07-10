@@ -1,0 +1,9 @@
+/build/
+/.cache/
+*.o
+*.a
+*.so
+*.so.*
+*.swp
+*.swo
+*~

@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.18)
+project(socket-example LANGUAGES CXX)
+
+find_package(interface-apis REQUIRED)
+find_package(telemetry-api REQUIRED)
+find_package(Threads REQUIRED)
+
+add_executable(cc-socket-example-static-cmake socketExample.cc)
+target_link_libraries(cc-socket-example-static-cmake interface-apis::interface-apis-static)
+
+add_executable(cc-socket-example-shared-cmake socketExample.cc)
+target_link_libraries(cc-socket-example-shared-cmake interface-apis::interface-apis-shared Threads::Threads)
+
+add_executable(cc-standalone-telemetry-example-static-cmake standaloneTelemetryExample.cc)
+target_link_libraries(cc-standalone-telemetry-example-static-cmake telemetry-api::telemetry-api-static)
+
+add_executable(cc-standalone-telemetry-example-shared-cmake standaloneTelemetryExample.cc)
+target_link_libraries(cc-standalone-telemetry-example-shared-cmake telemetry-api::telemetry-api-shared)
