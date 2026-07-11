@@ -145,15 +145,19 @@ If the project grows into a more production-oriented Linux Bluetooth layer, a D-
 Required:
 
 - C compiler with C11 support
+- C++ compiler with C++17 support
 - CMake 3.18 or newer
 - BlueZ development headers and library
+- `libnl-3` and `libnl-genl-3` development headers and libraries
 
 Headers/libraries used by the implementation:
 
 - `bluetooth/bluetooth.h`
 - `bluetooth/hci.h`
 - `bluetooth/hci_lib.h`
-- Linux wireless headers such as `linux/wireless.h`
+- `linux/nl80211.h`
+- `netlink/netlink.h`
+- `netlink/genl/genl.h`
 - Standard POSIX networking and ioctl headers
 
 ### Runtime
@@ -166,7 +170,7 @@ Bluetooth:
 
 Wi-Fi:
 
-- Linux wireless extensions support in the driver/kernel path used by the interface
+- Linux `nl80211`/cfg80211 support in the driver/kernel path used by the interface
 - A local wireless interface
 - Sufficient permissions to trigger scans or change interface state
 
@@ -223,7 +227,7 @@ Bluetooth discoveries: 1
 Wi-Fi adapters: 1
   [0] mac=2C:CF:67:56:88:BE ssid=Apolo type=1
 Wi-Fi discoveries: 1
-  [0] mac=00:00:01:00:74:AC ssid= rssi_valid=1 rssi_dbm=0
+  [0] mac=74:AC:B9:5F:73:11 ssid=Apolo rssi_valid=1 rssi_dbm=-53
 ```
 
 ```text
@@ -356,7 +360,7 @@ Possible causes:
 Possible causes:
 
 - No wireless interface present
-- Driver does not support the wireless extensions scan path used here
+- Driver does not support the `nl80211` scan path used here
 - Scan trigger requires privileges
 - Interface is down
 
@@ -378,7 +382,7 @@ ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
 
 ## Limitations
 
-- Wi-Fi scanning currently uses Linux wireless extensions rather than `nl80211`.
+- Wi-Fi scanning uses `nl80211` via `libnl`.
 - Bluetooth discovery is implemented with classic HCI inquiry and does not yet provide a richer BLE discovery model.
 - GPS parsing currently targets `gpsd` JSON TPV/POLL messages and does not use `libgps`.
 - Callback registration is not implemented.

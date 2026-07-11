@@ -1,30 +1,62 @@
 cmake_minimum_required(VERSION 3.18)
-project(sensor_lib LANGUAGES C)
+project(sensor_lib LANGUAGES C CXX)
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(LIBNL QUIET libnl-3.0 libnl-genl-3.0)
+endif()
+
+if(LIBNL_FOUND)
+    set(SENSOR_LIB_WIFI_INCLUDE_DIRS ${LIBNL_INCLUDE_DIRS})
+    set(SENSOR_LIB_WIFI_LIBRARY_DIRS ${LIBNL_LIBRARY_DIRS})
+    set(SENSOR_LIB_WIFI_LIBRARIES ${LIBNL_LIBRARIES})
+else()
+    find_path(LIBNL_INCLUDE_DIR NAMES netlink/netlink.h PATHS /usr/include/libnl3)
+    find_library(LIBNL3_LIBRARY NAMES nl-3 libnl-3)
+    find_library(LIBNL_GENL3_LIBRARY NAMES nl-genl-3 libnl-genl-3)
+
+    if(LIBNL_INCLUDE_DIR AND LIBNL3_LIBRARY AND LIBNL_GENL3_LIBRARY)
+        set(SENSOR_LIB_WIFI_INCLUDE_DIRS ${LIBNL_INCLUDE_DIR})
+        set(SENSOR_LIB_WIFI_LIBRARIES ${LIBNL3_LIBRARY} ${LIBNL_GENL3_LIBRARY})
+    else()
+        message(FATAL_ERROR "libnl-3 and libnl-genl-3 development files are required for Wi-Fi scanning")
+    endif()
+endif()
 
 add_library(sensor-lib STATIC
     src/instrument_api.c
+    src/wifi_scanner_bridge.cpp
 )
 
 add_library(sensor-lib-shared SHARED
     src/instrument_api.c
+    src/wifi_scanner_bridge.cpp
 )
 
 target_include_directories(sensor-lib
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/c
+    PRIVATE
+        ${SENSOR_LIB_WIFI_INCLUDE_DIRS}
 )
 
 target_include_directories(sensor-lib-shared
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/c
+    PRIVATE
+        ${SENSOR_LIB_WIFI_INCLUDE_DIRS}
 )
 
 target_compile_features(sensor-lib PUBLIC c_std_11)
 target_compile_features(sensor-lib-shared PUBLIC c_std_11)
+target_compile_features(sensor-lib PUBLIC cxx_std_17)
+target_compile_features(sensor-lib-shared PUBLIC cxx_std_17)
 target_compile_options(sensor-lib PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(sensor-lib-shared PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(sensor-lib PUBLIC bluetooth)
-target_link_libraries(sensor-lib-shared PUBLIC bluetooth)
+target_link_directories(sensor-lib PRIVATE ${SENSOR_LIB_WIFI_LIBRARY_DIRS})
+target_link_directories(sensor-lib-shared PRIVATE ${SENSOR_LIB_WIFI_LIBRARY_DIRS})
+target_link_libraries(sensor-lib PUBLIC bluetooth ${SENSOR_LIB_WIFI_LIBRARIES})
+target_link_libraries(sensor-lib-shared PUBLIC bluetooth ${SENSOR_LIB_WIFI_LIBRARIES})
 set_target_properties(sensor-lib-shared PROPERTIES OUTPUT_NAME sensor-lib)
 
 add_executable(instrument-cli

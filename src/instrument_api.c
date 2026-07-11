@@ -4,6 +4,7 @@
 
 #include "bluetooth_typedef.h"
 #include "gps_typedef.h"
+#include "wifi_scanner_bridge.h"
 #include "wifi_typedef.h"
 
 #include <arpa/inet.h>
@@ -29,8 +30,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define WIFI_SCAN_BUFFER_SIZE 32768U
-#define WIFI_SCAN_TIMEOUT_MS  5000U
 #define GPSD_DEFAULT_HOST     "127.0.0.1"
 #define GPSD_DEFAULT_PORT     2947
 #define GPSD_READ_TIMEOUT_MS  2500U
@@ -65,23 +64,6 @@ static void copy_string(char* const dst, const size_t dst_size, const char* cons
 
     strncpy(dst, src, dst_size - 1U);
     dst[dst_size - 1U] = '\0';
-}
-
-static void format_mac_from_sockaddr(const struct sockaddr* const addr, char* const dst, const size_t dst_size) {
-    if ((addr == NULL) || (dst == NULL) || (dst_size < 18U)) {
-        return;
-    }
-
-    const unsigned char* const bytes = (const unsigned char*)addr->sa_data;
-    snprintf(dst,
-             dst_size,
-             "%02X:%02X:%02X:%02X:%02X:%02X",
-             bytes[0],
-             bytes[1],
-             bytes[2],
-             bytes[3],
-             bytes[4],
-             bytes[5]);
 }
 
 static instrument_api_status_t open_inet_dgram_socket(int* const fd_out) {
@@ -289,69 +271,6 @@ static instrument_api_status_t wifi_set_up(const bool up) {
     return status;
 }
 
-static int wifi_quality_to_dbm(const struct iw_quality qual) {
-    if ((qual.updated & IW_QUAL_LEVEL_INVALID) != 0U) {
-        return 0;
-    }
-
-    if (((qual.updated & IW_QUAL_DBM) != 0U) || (qual.level > 63U)) {
-        return (qual.level >= 64U) ? ((int)qual.level - 0x100) : (int)qual.level;
-    }
-
-    return (int)qual.level;
-}
-
-static instrument_api_status_t wifi_wait_for_scan_results(const int       fd,
-                                                          const char*     ifname,
-                                                          unsigned char*  scan_buffer,
-                                                          const size_t    scan_buffer_size,
-                                                          struct iwreq*   req) {
-    const struct timespec sleep_step = {
-        .tv_sec  = 0,
-        .tv_nsec = 100L * 1000L * 1000L,
-    };
-    uint32_t waited_ms = 0U;
-
-    while (waited_ms <= WIFI_SCAN_TIMEOUT_MS) {
-        memset(req, 0, sizeof(*req));
-        copy_string(req->ifr_name, sizeof(req->ifr_name), ifname);
-        req->u.data.pointer = scan_buffer;
-        req->u.data.length  = (uint16_t)scan_buffer_size;
-        req->u.data.flags   = 0U;
-
-        if (ioctl(fd, SIOCGIWSCAN, req) == 0) {
-            return INSTRUMENT_API_SUCCESS;
-        }
-
-        if ((errno != EAGAIN) && (errno != EBUSY)) {
-            return INSTRUMENT_API_ERROR;
-        }
-
-        nanosleep(&sleep_step, NULL);
-        waited_ms += 100U;
-    }
-
-    return INSTRUMENT_API_ERROR;
-}
-
-static instrument_api_status_t wifi_trigger_scan(const int fd, const char* const ifname) {
-    struct iwreq req;
-    memset(&req, 0, sizeof(req));
-    copy_string(req.ifr_name, sizeof(req.ifr_name), ifname);
-    req.u.data.pointer = NULL;
-    req.u.data.length  = 0U;
-    req.u.data.flags   = 0U;
-
-    if (ioctl(fd, SIOCSIWSCAN, &req) != 0) {
-        if ((errno == EPERM) || (errno == EOPNOTSUPP)) {
-            return INSTRUMENT_API_NOT_SUPPORTED;
-        }
-        return INSTRUMENT_API_ERROR;
-    }
-
-    return INSTRUMENT_API_SUCCESS;
-}
-
 static instrument_api_status_t wifi_discover_devices(InstrumentOutputType output_data, uint32_t* const output_len) {
     if ((output_data == NULL) || (output_len == NULL)) {
         return INSTRUMENT_API_ERROR;
@@ -363,92 +282,7 @@ static instrument_api_status_t wifi_discover_devices(InstrumentOutputType output
         return INSTRUMENT_API_NOT_SUPPORTED;
     }
 
-    int fd = -1;
-    if (open_inet_dgram_socket(&fd) != INSTRUMENT_API_SUCCESS) {
-        return INSTRUMENT_API_ERROR;
-    }
-
-    instrument_api_status_t status = wifi_trigger_scan(fd, ifname);
-    if ((status != INSTRUMENT_API_SUCCESS) && (status != INSTRUMENT_API_NOT_SUPPORTED)) {
-        close(fd);
-        return status;
-    }
-
-    unsigned char scan_buffer[WIFI_SCAN_BUFFER_SIZE];
-    struct iwreq  scan_req;
-    status = wifi_wait_for_scan_results(fd, ifname, scan_buffer, sizeof(scan_buffer), &scan_req);
-    close(fd);
-    if (status != INSTRUMENT_API_SUCCESS) {
-        return status;
-    }
-
-    WifiDeviceInfoBase* const devices = (WifiDeviceInfoBase*)output_data;
-    uint32_t                  count   = 0U;
-    WifiDeviceInfoBase*       current = NULL;
-
-    const unsigned char* pos = scan_buffer;
-    const unsigned char* end = scan_buffer + scan_req.u.data.length;
-
-    while ((pos + IW_EV_LCP_PK_LEN) <= end) {
-        uint16_t event_len = 0U;
-        uint16_t event_cmd = 0U;
-        memcpy(&event_len, pos, sizeof(event_len));
-        memcpy(&event_cmd, pos + sizeof(event_len), sizeof(event_cmd));
-
-        if ((event_len <= IW_EV_LCP_PK_LEN) || ((size_t)(end - pos) < event_len)) {
-            break;
-        }
-
-        switch (event_cmd) {
-        case SIOCGIWAP:
-            if ((event_len >= IW_EV_ADDR_PK_LEN) && (count < WIFI_MAX_DEVICES)) {
-                current = &devices[count];
-                memset(current, 0, sizeof(*current));
-                current->type = WIFI_ROUTER;
-                struct sockaddr ap_addr;
-                memset(&ap_addr, 0, sizeof(ap_addr));
-                memcpy(&ap_addr, pos + IW_EV_LCP_PK_LEN, sizeof(ap_addr));
-                format_mac_from_sockaddr(&ap_addr, current->mac_address, sizeof(current->mac_address));
-                ++count;
-            } else {
-                current = NULL;
-            }
-            break;
-        case SIOCGIWESSID:
-            if ((current != NULL) && (event_len >= IW_EV_POINT_PK_LEN)) {
-                uint16_t essid_len = 0U;
-                memcpy(&essid_len, pos + IW_EV_LCP_PK_LEN, sizeof(essid_len));
-                if (essid_len > 0U) {
-                    const size_t payload_len = event_len - IW_EV_POINT_PK_LEN;
-                    if (essid_len > payload_len) {
-                        essid_len = (uint16_t)payload_len;
-                    }
-                    if (essid_len >= sizeof(current->ssid)) {
-                        essid_len = (uint16_t)(sizeof(current->ssid) - 1U);
-                    }
-                    memcpy(current->ssid, pos + IW_EV_POINT_PK_LEN, essid_len);
-                    current->ssid[essid_len] = '\0';
-                }
-            }
-            break;
-        case IWEVQUAL:
-            if ((current != NULL) && (event_len >= IW_EV_QUAL_PK_LEN)) {
-                struct iw_quality qual;
-                memset(&qual, 0, sizeof(qual));
-                memcpy(&qual, pos + IW_EV_LCP_PK_LEN, sizeof(qual));
-                current->rssi.value_dbm = (int16_t)wifi_quality_to_dbm(qual);
-                current->rssi.valid     = ((qual.updated & IW_QUAL_LEVEL_INVALID) == 0U);
-            }
-            break;
-        default:
-            break;
-        }
-
-        pos += event_len;
-    }
-
-    *output_len = count;
-    return INSTRUMENT_API_SUCCESS;
+    return wifi_discover_devices_nl80211(ifname, output_data, output_len);
 }
 
 static EBluetoothDeviceMajor bluetooth_major_from_class(const uint8_t dev_class[3]) {
