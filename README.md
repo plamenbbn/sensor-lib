@@ -15,6 +15,7 @@ This repository currently provides:
 - A C implementation of [`interfaces/c/instrument_api.h`](./interfaces/c/instrument_api.h)
 - A static library target: `sensor-lib`
 - A command-line test tool: `instrument-cli`
+- A repeated sensing stress test: `repeat-sensing-test`
 - Existing example programs under [`examples/`](./examples/)
 
 The implemented actions are:
@@ -75,7 +76,8 @@ sensor-lib/
 ├── src/
 │   └── instrument_api.c        # Main library implementation
 └── tests/
-    └── instrument_cli.c        # CLI test application
+    ├── instrument_cli.c        # CLI test application
+    └── repeat_sensing_test.c   # Repeated sensing + leak check stress test
 ```
 
 ## Design Notes
@@ -190,7 +192,9 @@ cmake --build build -j
 Artifacts:
 
 - `build/libsensor-lib.a`
+- `build/libsensor-lib.so`
 - `build/instrument-cli`
+- `build/repeat-sensing-test`
 
 ## Usage
 
@@ -202,6 +206,8 @@ The simplest way to exercise the implemented actions is the CLI tool:
 ./build/instrument-cli bluetooth
 ./build/instrument-cli wifi
 ./build/instrument-cli gps
+./build/repeat-sensing-test
+./build/repeat-sensing-test 50
 ```
 
 Example output:
@@ -226,6 +232,20 @@ GPS mode: 3
 GPS timestamp: 1783721659
 GPS lat/lon/alt: 38.7566712850 -77.2266953040 46.412
 ```
+
+The repeated sensing test performs Bluetooth, Wi-Fi, and GPS sensing back-to-back for `N` iterations, defaulting to `20`, with a fixed 2-second delay between iterations:
+
+```bash
+./build/repeat-sensing-test
+./build/repeat-sensing-test 50
+```
+
+Behavior notes:
+
+- The test creates one `InstrumentAPI` handle for the full run and reuses it across all iterations.
+- `INSTRUMENT_API_NOT_SUPPORTED` is treated as a valid outcome for hosts that do not currently have Bluetooth, Wi-Fi, or GPS support available.
+- At the end of the run, the test prints every unique Bluetooth and Wi-Fi discovery it saw, including the first local timestamp when that device was observed.
+- On glibc-based Linux systems, the test also captures allocator usage after a warmup iteration and again at the end, then fails if retained heap usage keeps growing beyond a small allowance.
 
 ### Using the library from C
 
