@@ -1,0 +1,372 @@
+# sensor-lib
+
+`sensor-lib` is a small C library that exposes a generic instrument API for radio and positioning actions. The current implementation focuses on:
+
+- Bluetooth adapter discovery and nearby device scanning
+- Wi-Fi adapter discovery and nearby network/device scanning
+- GPS polling through `gpsd`
+
+The library is intentionally lightweight. It uses caller-provided output buffers, avoids unnecessary heap allocation in hot paths, and keeps the public interface in plain C.
+
+## Status
+
+This repository currently provides:
+
+- A C implementation of [`interfaces/c/instrument_api.h`](./interfaces/c/instrument_api.h)
+- A static library target: `sensor-lib`
+- A command-line test tool: `instrument-cli`
+- Existing example programs under [`examples/`](./examples/)
+
+The implemented actions are:
+
+- `INSTRUMENT_BLUETOOTH_GET_ADAPTER_INFO`
+- `INSTRUMENT_BLUETOOTH_DISCOVER_DEVICES`
+- `INSTRUMENT_BLUETOOTH_IS_UP`
+- `INSTRUMENT_BLUETOOTH_TURN_ON`
+- `INSTRUMENT_BLUETOOTH_TURN_OFF`
+- `INSTRUMENT_BLUETOOTH_SCAN_ON`
+- `INSTRUMENT_BLUETOOTH_SCAN_OFF`
+- `INSTRUMENT_WIFI_GET_MY_DEVICE`
+- `INSTRUMENT_WIFI_DISCOVER_DEVICES`
+- `INSTRUMENT_WIFI_IS_UP`
+- `INSTRUMENT_WIFI_TURN_ON`
+- `INSTRUMENT_WIFI_TURN_OFF`
+- `INSTRUMENT_WIFI_SCAN_ON`
+- `INSTRUMENT_WIFI_SCAN_OFF`
+- `INSTRUMENT_GPS_GET_POSITION`
+
+Callback registration and several other instrument types are currently stubbed and return `INSTRUMENT_API_NOT_SUPPORTED`.
+
+## Repository Layout
+
+```text
+sensor-lib/
+├── CMakeLists.txt              # Root build file for library + CLI test app
+├── README.md                   # Project documentation
+├── examples/
+│   ├── c/
+│   │   ├── CMakeLists.txt
+│   │   └── bluetoothExample.c
+│   └── cc/
+│       ├── CMakeLists.txt
+│       ├── bluetoothExample.cc
+│       ├── demoApp.cc
+│       ├── exampleCMakeLists.txt
+│       ├── linkExample.cc
+│       ├── simulationExample.cc
+│       ├── socketExample.cc
+│       ├── standaloneTelemetryExample.cc
+│       ├── telemetryExample.cc
+│       └── wifiExample.cc
+├── interfaces/
+│   └── c/
+│       ├── action_typedef.h
+│       ├── bluetooth_typedef.h
+│       ├── callback_typedef.h
+│       ├── comms_typedef.h
+│       ├── gps_typedef.h
+│       ├── instrument_api.h
+│       ├── logger_typedef.h
+│       ├── rssi_typedef.h
+│       ├── sensing_typedef.h
+│       ├── sensor_api.h
+│       ├── simstate_typedef.h
+│       └── wifi_typedef.h
+├── src/
+│   └── instrument_api.c        # Main library implementation
+└── tests/
+    └── instrument_cli.c        # CLI test application
+```
+
+## Design Notes
+
+### Memory and allocation model
+
+The API is designed around caller-owned buffers:
+
+- The caller allocates input and output arrays.
+- The library writes results directly into those buffers.
+- Output counts are returned through `output_len`.
+
+This keeps memory ownership simple and makes leak avoidance much easier in C.
+
+Current behavior by subsystem:
+
+- Bluetooth discovery uses BlueZ inquiry APIs. BlueZ internally allocates the inquiry result buffer; the library frees it before returning.
+- Wi-Fi scanning uses stack buffers and writes directly into the caller output array.
+- GPS polling uses a stack receive buffer and returns a single `C_PositionInfo`.
+
+### Bluetooth implementation choice: `hci_lib` vs BlueZ D-Bus
+
+This project currently uses the low-level BlueZ HCI API in `<bluetooth/hci.h>` and `<bluetooth/hci_lib.h>`.
+
+Pros of `hci_lib` / raw HCI:
+
+- Low overhead
+- Simple fit for one-shot device discovery in plain C
+- Good for direct control of adapter-level operations
+- No D-Bus integration required
+
+Cons of `hci_lib` / raw HCI:
+
+- Lower-level and more brittle
+- Requires more direct handling of sockets, adapter state, flags, and timing
+- Easier to conflict with the system Bluetooth stack
+- Often requires elevated privileges
+- Less pleasant for modern BLE-centric workflows
+
+Pros of BlueZ D-Bus:
+
+- Better long-running integration with the system Bluetooth daemon
+- Higher-level object and property model
+- Better fit for BLE and richer device lifecycle handling
+- Less likely to interfere with desktop or service-managed Bluetooth use
+
+Cons of BlueZ D-Bus:
+
+- More setup and code complexity
+- More runtime overhead
+- Heavier dependency on D-Bus and BlueZ daemon behavior
+
+Why this repo uses `hci_lib` right now:
+
+- The current requirement is lean C-based discovery.
+- It keeps the first implementation small and direct.
+- It is a reasonable choice for a compact systems-oriented library.
+
+If the project grows into a more production-oriented Linux Bluetooth layer, a D-Bus-based discovery path would be a strong next step.
+
+## Dependencies
+
+### Build-time
+
+Required:
+
+- C compiler with C11 support
+- CMake 3.18 or newer
+- BlueZ development headers and library
+
+Headers/libraries used by the implementation:
+
+- `bluetooth/bluetooth.h`
+- `bluetooth/hci.h`
+- `bluetooth/hci_lib.h`
+- Linux wireless headers such as `linux/wireless.h`
+- Standard POSIX networking and ioctl headers
+
+### Runtime
+
+Bluetooth:
+
+- Linux with BlueZ support
+- A local Bluetooth adapter
+- Sufficient permissions to query and control the adapter
+
+Wi-Fi:
+
+- Linux wireless extensions support in the driver/kernel path used by the interface
+- A local wireless interface
+- Sufficient permissions to trigger scans or change interface state
+
+GPS:
+
+- `gpsd` listening on `127.0.0.1:2947`
+- A GPS receiver visible to `gpsd`
+
+Notes:
+
+- GPS polling can succeed with `mode=MODE_NOT_SEEN` or `mode=MODE_NO_FIX` when `gpsd` is reachable but no valid fix is available yet.
+- If `gpsd` is running but has no active receiver, the API returns a structured “no fix/no device yet” result instead of crashing or leaking resources.
+
+## Build
+
+From the repository root:
+
+```bash
+cmake -S . -B build
+cmake --build build -j
+```
+
+Artifacts:
+
+- `build/libsensor-lib.a`
+- `build/instrument-cli`
+
+## Usage
+
+### CLI test application
+
+The simplest way to exercise the implemented actions is the CLI tool:
+
+```bash
+./build/instrument-cli bluetooth
+./build/instrument-cli wifi
+./build/instrument-cli gps
+```
+
+Example output:
+
+```text
+Bluetooth adapters: 1
+  [0] id=0 mac=2C:CF:67:56:88:BF name=hci0 flags=0x0000001D type=3
+Bluetooth discoveries: 1
+  [0] mac=9C:83:06:F6:09:A5 name=Plamen's S26 Ultra class=12/2/90 major=2
+```
+
+```text
+Wi-Fi adapters: 1
+  [0] mac=2C:CF:67:56:88:BE ssid=Apolo type=1
+Wi-Fi discoveries: 1
+  [0] mac=00:00:01:00:74:AC ssid= rssi_valid=1 rssi_dbm=0
+```
+
+```text
+GPS count: 1
+GPS mode: 3
+GPS timestamp: 1783721659
+GPS lat/lon/alt: 38.7566712850 -77.2266953040 46.412
+```
+
+### Using the library from C
+
+Basic flow:
+
+1. Create an `InstrumentAPI` handle
+2. Allocate output buffers sized to the relevant max constants
+3. Call `instrumentAction(...)`
+4. Inspect `output_len`
+5. Destroy the API handle
+
+Example:
+
+```c
+#include "instrument_api.h"
+#include "bluetooth_typedef.h"
+
+int main(void) {
+    InstrumentAPIConfig config = {0};
+    InstrumentAPI *api = createInstrumentAPI(config);
+    if (api == NULL) {
+        return 1;
+    }
+
+    BluetoothAdapterInfoBase adapters[BLUETOOTH_MAX_ADAPTERS];
+    uint32_t adapter_count = 0;
+
+    instrument_api_status_t status = api->instrumentAction(
+        INSTRUMENT_BLUETOOTH_GET_ADAPTER_INFO,
+        NULL,
+        0,
+        adapters,
+        &adapter_count);
+
+    destroyInstrumentAPI(api);
+    return (status == INSTRUMENT_API_SUCCESS) ? 0 : 1;
+}
+```
+
+## Test Cases
+
+Current manual test coverage centers on the CLI app and direct runtime validation.
+
+### Bluetooth tests
+
+- Adapter enumeration returns at least one local adapter when hardware is present.
+- Discovery returns nearby devices visible at scan time.
+- Adapter up-state query returns a boolean.
+- Adapter power on/off paths invoke the expected HCI device controls.
+
+Suggested manual commands:
+
+```bash
+./build/instrument-cli bluetooth
+```
+
+### Wi-Fi tests
+
+- Wireless adapter enumeration returns available local Wi-Fi interfaces.
+- Scan results return available BSS/device entries visible at scan time.
+- Interface up-state query returns a boolean.
+- Interface power on/off uses standard network interface flags.
+
+Suggested manual commands:
+
+```bash
+./build/instrument-cli wifi
+```
+
+### GPS tests
+
+- `gpsd` reachable but no receiver: returns one record with `MODE_NOT_SEEN`
+- Receiver present but no fix yet: returns one record with `MODE_NO_FIX`
+- Receiver with live fix: returns one record with `MODE_2D` or `MODE_3D` and valid coordinates
+
+Suggested manual commands:
+
+```bash
+./build/instrument-cli gps
+```
+
+Useful direct daemon inspection:
+
+```bash
+python3 - <<'PY'
+import socket
+s = socket.socket()
+s.connect(('127.0.0.1', 2947))
+print(s.recv(4096).decode())
+s.sendall(b'?WATCH={"enable":true,"json":true};\n?POLL;\n')
+print(s.recv(4096).decode())
+PY
+```
+
+## Troubleshooting
+
+### Bluetooth discovery fails
+
+Possible causes:
+
+- No Bluetooth adapter present
+- Adapter is down
+- Insufficient privileges
+- BlueZ stack or kernel support is unavailable
+
+### Wi-Fi discovery fails
+
+Possible causes:
+
+- No wireless interface present
+- Driver does not support the wireless extensions scan path used here
+- Scan trigger requires privileges
+- Interface is down
+
+### GPS returns zero coordinates or `MODE_NOT_SEEN`
+
+Possible causes:
+
+- `gpsd` is running but has no active GPS device
+- Receiver is attached but no fix has been acquired yet
+- `gpsd` is not bound to `127.0.0.1:2947`
+
+Check:
+
+```bash
+ss -ltnp | grep 2947
+systemctl status gpsd
+ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
+```
+
+## Limitations
+
+- Wi-Fi scanning currently uses Linux wireless extensions rather than `nl80211`.
+- Bluetooth discovery is implemented with classic HCI inquiry and does not yet provide a richer BLE discovery model.
+- GPS parsing currently targets `gpsd` JSON TPV/POLL messages and does not use `libgps`.
+- Callback registration is not implemented.
+
+## Future Work
+
+- Add automated unit/integration tests
+- Add richer BLE discovery support
+- Add `nl80211`-based Wi-Fi scanning for broader driver compatibility
+- Add configurable GPS host/port and longer polling/fix timeout behavior
+- Implement callback registration and continuous scan support
