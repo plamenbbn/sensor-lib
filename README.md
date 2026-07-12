@@ -150,6 +150,13 @@ Required:
 - BlueZ development headers and library
 - `libnl-3` and `libnl-genl-3` development headers and libraries
 
+On Debian/Ubuntu/Raspberry Pi OS, install everything needed to build and exercise the current implementation with:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake g++ libbluetooth-dev libnl-3-dev libnl-genl-3-dev gpsd gpsd-clients pkg-config
+```
+
 Headers/libraries used by the implementation:
 
 - `bluetooth/bluetooth.h`
