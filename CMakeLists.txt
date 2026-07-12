@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
 project(sensor_lib LANGUAGES C CXX)
 
+set(SENSOR_LIB_BLUETOOTH_SCANNER "bluez" CACHE STRING "Bluetooth discovery backend: bluez or hci")
+set_property(CACHE SENSOR_LIB_BLUETOOTH_SCANNER PROPERTY STRINGS bluez hci)
+
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(LIBNL QUIET libnl-3.0 libnl-genl-3.0)
@@ -32,6 +35,21 @@ add_library(sensor-lib-shared SHARED
     src/instrument_api.c
     src/wifi_scanner_bridge.cpp
 )
+
+if(SENSOR_LIB_BLUETOOTH_SCANNER STREQUAL "bluez")
+    set(SENSOR_LIB_BLUETOOTH_SCANNER_SOURCE src/bluez_scanner.c)
+    target_compile_definitions(sensor-lib PUBLIC SENSOR_LIB_BLUETOOTH_SCANNER_BLUEZ=1)
+    target_compile_definitions(sensor-lib-shared PUBLIC SENSOR_LIB_BLUETOOTH_SCANNER_BLUEZ=1)
+elseif(SENSOR_LIB_BLUETOOTH_SCANNER STREQUAL "hci")
+    set(SENSOR_LIB_BLUETOOTH_SCANNER_SOURCE src/hci_scanner.c)
+    target_compile_definitions(sensor-lib PUBLIC SENSOR_LIB_BLUETOOTH_SCANNER_HCI=1)
+    target_compile_definitions(sensor-lib-shared PUBLIC SENSOR_LIB_BLUETOOTH_SCANNER_HCI=1)
+else()
+    message(FATAL_ERROR "SENSOR_LIB_BLUETOOTH_SCANNER must be either 'bluez' or 'hci'")
+endif()
+
+target_sources(sensor-lib PRIVATE ${SENSOR_LIB_BLUETOOTH_SCANNER_SOURCE})
+target_sources(sensor-lib-shared PRIVATE ${SENSOR_LIB_BLUETOOTH_SCANNER_SOURCE})
 
 target_include_directories(sensor-lib
     PUBLIC

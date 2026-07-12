@@ -74,7 +74,12 @@ sensor-lib/
 │       ├── simstate_typedef.h
 │       └── wifi_typedef.h
 ├── src/
-│   └── instrument_api.c        # Main library implementation
+│   ├── instrument_api.c        # Main library implementation and action dispatch
+│   ├── bluetooth_scanner.h     # Bluetooth discovery backend interface
+│   ├── bluez_scanner.c         # Default BlueZ-backed Bluetooth discovery
+│   ├── hci_scanner.c           # Legacy raw HCI inquiry discovery
+│   ├── wifi_scanner_bridge.h   # C-to-C++ bridge for Wi-Fi scanning
+│   └── wifi_scanner_bridge.cpp # nl80211/libnl Wi-Fi discovery implementation
 └── tests/
     ├── instrument_cli.c        # CLI test application
     └── repeat_sensing_test.c   # Repeated sensing + leak check stress test
@@ -94,49 +99,45 @@ This keeps memory ownership simple and makes leak avoidance much easier in C.
 
 Current behavior by subsystem:
 
-- Bluetooth discovery uses BlueZ inquiry APIs. BlueZ internally allocates the inquiry result buffer; the library frees it before returning.
+- Bluetooth discovery is selected at compile time behind a small scanner interface.
+- The default `bluez` backend shells out to BlueZ userspace tools to perform a short discovery run and then enriches discovered devices with additional metadata when BlueZ exposes it.
+- The optional `hci` backend uses low-level `hci_inquiry()`. BlueZ internally allocates the inquiry result buffer there, and the library frees it before returning.
 - Wi-Fi scanning uses stack buffers and writes directly into the caller output array.
 - GPS polling uses a stack receive buffer and returns a single `C_PositionInfo`.
 
-### Bluetooth implementation choice: `hci_lib` vs BlueZ D-Bus
+### Bluetooth implementation choice: `bluez` vs `hci`
 
-This project currently uses the low-level BlueZ HCI API in `<bluetooth/hci.h>` and `<bluetooth/hci_lib.h>`.
+This project now supports two Bluetooth discovery implementations behind the same `INSTRUMENT_BLUETOOTH_DISCOVER_DEVICES` action.
 
-Pros of `hci_lib` / raw HCI:
+Pros of `bluez`:
+
+- Richer device discovery, especially for BLE advertisers
+- Results are closer to what users see from `bluetoothctl scan on`
+- Better alignment with the system Bluetooth daemon and its view of the world
+
+Cons of `bluez`:
+
+- More runtime overhead
+- Depends on BlueZ userspace tooling being present and functional
+- Some transient BLE devices may still expose only minimal metadata
+
+Pros of `hci` / raw HCI:
 
 - Low overhead
-- Simple fit for one-shot device discovery in plain C
-- Good for direct control of adapter-level operations
-- No D-Bus integration required
+- Simple fit for direct classic Bluetooth inquiry
+- Good fallback when a very small low-level build is preferred
 
-Cons of `hci_lib` / raw HCI:
+Cons of `hci` / raw HCI:
 
-- Lower-level and more brittle
-- Requires more direct handling of sockets, adapter state, flags, and timing
-- Easier to conflict with the system Bluetooth stack
-- Often requires elevated privileges
-- Less pleasant for modern BLE-centric workflows
+- Narrower discovery coverage, especially for BLE-heavy environments
+- One-shot inquiry behavior tends to see fewer devices than BlueZ userspace scanning
+- More likely to diverge from what desktop tools report
 
-Pros of BlueZ D-Bus:
+Why `bluez` is the default now:
 
-- Better long-running integration with the system Bluetooth daemon
-- Higher-level object and property model
-- Better fit for BLE and richer device lifecycle handling
-- Less likely to interfere with desktop or service-managed Bluetooth use
-
-Cons of BlueZ D-Bus:
-
-- More setup and code complexity
-- More runtime overhead
-- Heavier dependency on D-Bus and BlueZ daemon behavior
-
-Why this repo uses `hci_lib` right now:
-
-- The current requirement is lean C-based discovery.
-- It keeps the first implementation small and direct.
-- It is a reasonable choice for a compact systems-oriented library.
-
-If the project grows into a more production-oriented Linux Bluetooth layer, a D-Bus-based discovery path would be a strong next step.
+- The main goal is richer discovery that looks more like `bluetoothctl`
+- It produces materially better results on BLE-heavy hosts
+- The old HCI path remains available for compile-time selection
 
 ## Dependencies
 
@@ -156,6 +157,12 @@ On Debian/Ubuntu/Raspberry Pi OS, install everything needed to build and exercis
 sudo apt update
 sudo apt install -y build-essential cmake g++ libbluetooth-dev libnl-3-dev libnl-genl-3-dev gpsd gpsd-clients pkg-config
 ```
+
+Bluetooth discovery backends:
+
+- `bluez` is the default backend and uses BlueZ userspace discovery via `bluetoothctl`, which tends to produce results closer to `bluetoothctl scan on`
+- `hci` uses the older low-level `hci_inquiry()` path
+- Choose the backend at configure time with `-DSENSOR_LIB_BLUETOOTH_SCANNER=bluez` or `-DSENSOR_LIB_BLUETOOTH_SCANNER=hci`
 
 Headers/libraries used by the implementation:
 
@@ -200,6 +207,13 @@ cmake -S . -B build
 cmake --build build -j
 ```
 
+To force a specific Bluetooth discovery backend:
+
+```bash
+cmake -S . -B build -DSENSOR_LIB_BLUETOOTH_SCANNER=bluez
+cmake -S . -B build-hci -DSENSOR_LIB_BLUETOOTH_SCANNER=hci
+```
+
 Artifacts:
 
 - `build/libsensor-lib.a`
@@ -226,8 +240,11 @@ Example output:
 ```text
 Bluetooth adapters: 1
   [0] id=0 mac=2C:CF:67:56:88:BF name=hci0 flags=0x0000001D type=3
-Bluetooth discoveries: 1
-  [0] mac=9C:83:06:F6:09:A5 name=Plamen's S26 Ultra class=12/2/90 major=2
+Bluetooth discoveries: 15
+  [0] mac=E4:65:B8:C8:B1:72 name=IPSTube_C8B172 class=0/0/0 major=63
+  [1] mac=6A:8C:78:F3:9E:7B name=6A-8C-78-F3-9E-7B class=0/0/0 major=63
+  ...
+  [14] mac=9C:83:06:F6:09:A5 name=Plamen's S26 Ultra class=12/2/90 major=2
 ```
 
 ```text
@@ -303,7 +320,8 @@ Current manual test coverage centers on the CLI app and direct runtime validatio
 ### Bluetooth tests
 
 - Adapter enumeration returns at least one local adapter when hardware is present.
-- Discovery returns nearby devices visible at scan time.
+- BlueZ backend returns a richer set of nearby devices visible during the discovery window.
+- HCI backend still builds and returns classic inquiry results when explicitly selected.
 - Adapter up-state query returns a boolean.
 - Adapter power on/off paths invoke the expected HCI device controls.
 
@@ -361,6 +379,7 @@ Possible causes:
 - Adapter is down
 - Insufficient privileges
 - BlueZ stack or kernel support is unavailable
+- BlueZ backend tooling is unavailable or discovery is blocked by the host stack state
 
 ### Wi-Fi discovery fails
 
@@ -390,14 +409,13 @@ ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
 ## Limitations
 
 - Wi-Fi scanning uses `nl80211` via `libnl`.
-- Bluetooth discovery is implemented with classic HCI inquiry and does not yet provide a richer BLE discovery model.
+- Bluetooth discovery supports either a BlueZ-backed scan path or a classic HCI inquiry path. The default BlueZ backend usually finds more BLE devices, but some transient BLE entries still expose only partial metadata.
 - GPS parsing currently targets `gpsd` JSON TPV/POLL messages and does not use `libgps`.
 - Callback registration is not implemented.
 
 ## Future Work
 
 - Add automated unit/integration tests
-- Add richer BLE discovery support
-- Add `nl80211`-based Wi-Fi scanning for broader driver compatibility
+- Replace the current BlueZ userspace tool integration with a direct BlueZ IPC/client implementation
 - Add configurable GPS host/port and longer polling/fix timeout behavior
 - Implement callback registration and continuous scan support
