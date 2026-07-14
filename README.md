@@ -50,7 +50,8 @@ When the API is created, a background comms runtime starts a Bluetooth L2CAP ser
 runtime scans for Bluetooth peers and Wi-Fi ARP neighbors, attempts the `packet-comms` style `Hello Pi World` /
 `Hello Back from ...` handshake, and publishes a `BratislavaLink` with an established socket fd when the handshake
 completes. The dedicated link-callback harness runs indefinitely until interrupted and prints a per-iteration status
-summary after each scan-and-connect cycle.
+summary after each scan-and-connect cycle. Bluetooth scan output also filters out BlueZ metadata lines such as
+`RSSI:` and renders missing Bluetooth device names as `<NONE>` for consistent formatting.
 
 ## Repository Layout
 
@@ -252,6 +253,27 @@ The simplest way to exercise the implemented actions is the CLI tool:
 ./build/repeat-sensing-test 50
 ```
 
+The link-callback harness supports two Wi-Fi test modes:
+
+```bash
+./build/instrument-cli link-callback --wifi-mode client
+./build/instrument-cli link-callback --wifi-mode hotspot
+./build/instrument-cli link-callback --wifi-mode wap
+```
+
+Mode behavior:
+
+- `client` leaves Wi-Fi in normal station/client mode and runs the discovery + handshake loop there.
+- `hotspot`/`wap` asks NetworkManager to create a temporary access point named `sensor-lib-link-callback`.
+- On exit, hotspot mode attempts to tear the temporary hotspot down and restore the previous active Wi-Fi client connection. If no previous connection is known, it falls back to reconnecting the wireless interface generically.
+
+Hotspot/client transition notes:
+
+- Every `nmcli` step in the harness is bounded to `15 seconds`.
+- Timed operations include enabling Wi-Fi, starting hotspot mode, stopping hotspot mode, deleting the temporary hotspot profile, and restoring normal Wi-Fi afterward.
+- If one of those steps times out, the harness logs the specific step that hung and continues running instead of failing fast.
+- Depending on driver and NetworkManager behavior, hotspot mode may fail to come up cleanly on some hosts. In that case, the harness may still be reporting scans from the normal client connection rather than a true AP-mode vantage point.
+
 Example output:
 
 ```text
@@ -276,6 +298,13 @@ GPS count: 1
 GPS mode: 3
 GPS timestamp: 1783721659
 GPS lat/lon/alt: 38.7566712850 -77.2266953040 46.412
+```
+
+Example Bluetooth formatting when a device has no reported label:
+
+```text
+Bluetooth discoveries: 3
+  [0] mac=AA:BB:CC:DD:EE:FF name=<NONE> class=0/0/0 major=63
 ```
 
 The repeated sensing test performs Bluetooth, Wi-Fi, and GPS sensing back-to-back for `N` iterations, defaulting to `20`, with a fixed 2-second delay between iterations:

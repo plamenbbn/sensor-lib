@@ -8,6 +8,7 @@
 
 #include <pthread.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -27,6 +28,7 @@ static pthread_mutex_t g_link_result_mutex = PTHREAD_MUTEX_INITIALIZER;
 static LinkResultRecord g_link_results[COMMS_MAX_LINKS * 4];
 static unsigned g_link_result_count = 0U;
 static volatile sig_atomic_t g_stop_requested = 0;
+static const unsigned g_nmcli_timeout_seconds = 15U;
 
 typedef struct {
     bool configured;
@@ -91,12 +93,35 @@ static bool read_first_line(const char* const command, char* const output, const
     return output[0] != '\0';
 }
 
-static bool run_command(const char* const command) {
+static bool run_timed_command(const char* const label, const char* const command, const bool warn_only) {
     if (command == NULL) {
         return false;
     }
-    const int rc = system(command);
-    return (rc == 0);
+
+    char wrapped_command[2048];
+    snprintf(wrapped_command,
+             sizeof(wrapped_command),
+             "timeout %us /bin/bash -lc \"%s\" >/dev/null 2>&1",
+             g_nmcli_timeout_seconds,
+             command);
+
+    const int rc = system(wrapped_command);
+    if (rc == 0) {
+        printf("[wifi-mode] %s: ok\n", label);
+        fflush(stdout);
+        return true;
+    }
+
+    if (WIFEXITED(rc) && (WEXITSTATUS(rc) == 124)) {
+        fprintf(stderr, "[wifi-mode] %s: timed out after %u seconds\n", label, g_nmcli_timeout_seconds);
+    } else if (WIFEXITED(rc)) {
+        fprintf(stderr, "[wifi-mode] %s: failed with exit code %d\n", label, WEXITSTATUS(rc));
+    } else {
+        fprintf(stderr, "[wifi-mode] %s: failed\n", label);
+    }
+    fflush(stderr);
+
+    return warn_only ? true : false;
 }
 
 static bool configure_wifi_mode(const HarnessWifiMode wifi_mode, WifiModeState* const state) {
@@ -120,26 +145,16 @@ static bool configure_wifi_mode(const HarnessWifiMode wifi_mode, WifiModeState* 
         return true;
     }
 
-    if (!run_command("nmcli radio wifi on >/dev/null 2>&1")) {
-        fprintf(stderr, "Failed to enable Wi-Fi radio before hotspot setup.\n");
-        return false;
-    }
-
-    if (!run_command(
-            "nmcli connection delete sensor-lib-link-callback-hotspot >/dev/null 2>&1 || true")) {
-        return false;
-    }
+    (void)run_timed_command("enable Wi-Fi radio", "nmcli radio wifi on", true);
+    (void)run_timed_command("delete stale hotspot profile", "nmcli connection delete sensor-lib-link-callback-hotspot || true", true);
 
     char command[1024];
     snprintf(command,
              sizeof(command),
              "nmcli device wifi hotspot ifname '%s' con-name sensor-lib-link-callback-hotspot "
-             "ssid sensor-lib-link-callback password sensorlib123 >/dev/null 2>&1",
+             "ssid sensor-lib-link-callback password sensorlib123",
              state->interface_name);
-    if (!run_command(command)) {
-        fprintf(stderr, "Failed to configure hotspot mode on %s.\n", state->interface_name);
-        return false;
-    }
+    (void)run_timed_command("start hotspot", command, true);
 
     state->configured = true;
     return true;
@@ -154,21 +169,21 @@ static void restore_wifi_mode(const WifiModeState* const state) {
         return;
     }
 
-    (void)run_command("nmcli connection down sensor-lib-link-callback-hotspot >/dev/null 2>&1");
-    (void)run_command("nmcli connection delete sensor-lib-link-callback-hotspot >/dev/null 2>&1");
+    (void)run_timed_command("bring hotspot down", "nmcli connection down sensor-lib-link-callback-hotspot", true);
+    (void)run_timed_command("delete hotspot profile", "nmcli connection delete sensor-lib-link-callback-hotspot", true);
 
     if (state->previous_connection[0] != '\0') {
         char command[1024];
         snprintf(command,
                  sizeof(command),
-                 "nmcli connection up '%s' ifname '%s' >/dev/null 2>&1",
+                 "nmcli connection up '%s' ifname '%s'",
                  state->previous_connection,
                  state->interface_name);
-        (void)run_command(command);
+        (void)run_timed_command("restore previous Wi-Fi connection", command, true);
     } else if (state->interface_name[0] != '\0') {
         char command[1024];
-        snprintf(command, sizeof(command), "nmcli device connect '%s' >/dev/null 2>&1", state->interface_name);
-        (void)run_command(command);
+        snprintf(command, sizeof(command), "nmcli device connect '%s'", state->interface_name);
+        (void)run_timed_command("restore generic Wi-Fi client mode", command, true);
     }
 }
 
