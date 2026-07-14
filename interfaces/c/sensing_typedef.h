@@ -48,6 +48,7 @@ typedef struct {
     uint32_t           messageLoss; // Never set. Do not use.
     BratislavaLinkType linkType;
     InstrumentType     instrumentType;
+    int                socketFd;
 
     union {
         BluetoothDeviceInfoBase bluetoothDeviceInfo;

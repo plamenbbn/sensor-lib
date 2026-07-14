@@ -4,6 +4,7 @@
 
 #include "bluetooth_scanner.h"
 #include "bluetooth_typedef.h"
+#include "comms_runtime.h"
 #include "gps_typedef.h"
 #include "wifi_scanner_bridge.h"
 #include "wifi_typedef.h"
@@ -639,6 +640,8 @@ static instrument_api_status_t instrument_action_impl(const InstrumentActions   
         return bluetooth_get_adapter_info(output_data, output_len);
     case INSTRUMENT_BLUETOOTH_DISCOVER_DEVICES:
         return bluetooth_discover_devices(input_data, input_len, output_data, output_len);
+    case INSTRUMENT_BLUETOOTH_DISCOVER_BRATISLAVA_LINKS:
+        return comms_runtime_discover_links(INSTRUMENT_BLUETOOTH, output_data, output_len);
     case INSTRUMENT_BLUETOOTH_IS_UP:
         return bluetooth_is_up(input_data, input_len, output_data, output_len);
     case INSTRUMENT_BLUETOOTH_TURN_ON:
@@ -653,6 +656,8 @@ static instrument_api_status_t instrument_action_impl(const InstrumentActions   
         return wifi_get_my_device(output_data, output_len);
     case INSTRUMENT_WIFI_DISCOVER_DEVICES:
         return wifi_discover_devices(output_data, output_len);
+    case INSTRUMENT_WIFI_DISCOVER_BRATISLAVA_LINKS:
+        return comms_runtime_discover_links(INSTRUMENT_WIFI, output_data, output_len);
     case INSTRUMENT_WIFI_IS_UP:
         return wifi_is_up(output_data, output_len);
     case INSTRUMENT_WIFI_TURN_ON:
@@ -665,6 +670,8 @@ static instrument_api_status_t instrument_action_impl(const InstrumentActions   
 
     case INSTRUMENT_GPS_GET_POSITION:
         return gps_get_position(output_data, output_len);
+    case INSTRUMENT_COMMS_DISCOVER_BRATISLAVA_LINKS:
+        return comms_runtime_discover_links(INSTRUMENT_COMMS, output_data, output_len);
 
     default:
         return INSTRUMENT_API_NOT_SUPPORTED;
@@ -674,19 +681,13 @@ static instrument_api_status_t instrument_action_impl(const InstrumentActions   
 static instrument_api_status_t register_callback_impl(const InstrumentType            instrument_type,
                                                       const CallbackType              callback_type,
                                                       const InstrumentInputType input_data) {
-    (void)instrument_type;
-    (void)callback_type;
-    (void)input_data;
-    return INSTRUMENT_API_NOT_SUPPORTED;
+    return comms_runtime_register_callback(instrument_type, callback_type, input_data);
 }
 
 static instrument_api_status_t unregister_callback_impl(const InstrumentType            instrument_type,
                                                         const CallbackType              callback_type,
                                                         const InstrumentInputType input_data) {
-    (void)instrument_type;
-    (void)callback_type;
-    (void)input_data;
-    return INSTRUMENT_API_NOT_SUPPORTED;
+    return comms_runtime_unregister_callback(instrument_type, callback_type, input_data);
 }
 
 InstrumentAPI* createInstrumentAPI(const InstrumentAPIConfig config) {
@@ -700,10 +701,16 @@ InstrumentAPI* createInstrumentAPI(const InstrumentAPIConfig config) {
     api->unregisterCallback = unregister_callback_impl;
     api->interfaceConfig    = config;
 
+    if (comms_runtime_initialize(&config) != INSTRUMENT_API_SUCCESS) {
+        free(api);
+        return NULL;
+    }
+
     return api;
 }
 
 void destroyInstrumentAPI(InstrumentAPI* const instrumentAPI) {
+    comms_runtime_shutdown();
     free(instrumentAPI);
 }
 

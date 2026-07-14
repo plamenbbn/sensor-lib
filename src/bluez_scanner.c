@@ -162,6 +162,12 @@ static bool parse_scan_line(const char* const line, BluezScanEntry* const entry)
     while ((*name != '\0') && isspace((unsigned char)*name)) {
         ++name;
     }
+    if ((strncmp(name, "RSSI:", strlen("RSSI:")) == 0) ||
+        (strncmp(name, "TxPower:", strlen("TxPower:")) == 0) ||
+        (strncmp(name, "ManufacturerData", strlen("ManufacturerData")) == 0) ||
+        (strncmp(name, "ServiceData", strlen("ServiceData")) == 0)) {
+        name = "";
+    }
     copy_string(entry->name, sizeof(entry->name), name);
     trim_trailing_whitespace(entry->name);
     return true;
@@ -215,6 +221,14 @@ static void parse_scan_output(const char* const output, BluezScanEntry* const en
     }
 
     free(buffer);
+}
+
+static void append_known_devices(BluezScanEntry* const entries, uint32_t* const count) {
+    char output[BLUEZ_INFO_OUTPUT_MAX];
+    if (!read_command_output("bluetoothctl --timeout 5 devices 2>/dev/null", output, sizeof(output))) {
+        return;
+    }
+    parse_scan_output(output, entries, count);
 }
 
 static void parse_class_property(const char* const info_output, BluetoothDeviceInfoBase* const device) {
@@ -304,6 +318,7 @@ instrument_api_status_t bluetooth_discover_devices_backend(const InstrumentInput
     memset(discovered, 0, sizeof(discovered));
     uint32_t discovered_count = 0U;
     parse_scan_output(scan_output, discovered, &discovered_count);
+    append_known_devices(discovered, &discovered_count);
 
     BluetoothDeviceInfoBase* const devices = (BluetoothDeviceInfoBase*)output_data;
     for (uint32_t i = 0U; i < discovered_count; ++i) {

@@ -1,16 +1,48 @@
 #include "instrument_api.h"
 
 #include "bluetooth_typedef.h"
+#include "callback_typedef.h"
+#include "comms_typedef.h"
 #include "gps_typedef.h"
+#include "link_callback_harness.h"
+#include "sensing_typedef.h"
 #include "wifi_typedef.h"
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+static const char* display_bt_name(const char* const name) {
+    return ((name != NULL) && (name[0] != '\0')) ? name : "<NONE>";
+}
 
 static void usage(const char* const argv0) {
-    fprintf(stderr, "Usage: %s bluetooth|wifi|gps\n", argv0);
+    fprintf(stderr,
+            "Usage: %s bluetooth|wifi|gps|comms|link-callback [--wifi-mode client|hotspot]\n",
+            argv0);
+}
+
+static bool parse_wifi_mode(int argc, char** argv, HarnessWifiMode* const wifi_mode) {
+    *wifi_mode = HARNESS_WIFI_MODE_CLIENT;
+    if (argc == 2) {
+        return true;
+    }
+
+    if ((argc == 4) && (strcmp(argv[2], "--wifi-mode") == 0)) {
+        if (strcmp(argv[3], "client") == 0) {
+            *wifi_mode = HARNESS_WIFI_MODE_CLIENT;
+            return true;
+        }
+        if ((strcmp(argv[3], "hotspot") == 0) || (strcmp(argv[3], "wap") == 0)) {
+            *wifi_mode = HARNESS_WIFI_MODE_HOTSPOT;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static int run_bluetooth(const InstrumentAPI* const api) {
@@ -32,7 +64,7 @@ static int run_bluetooth(const InstrumentAPI* const api) {
                i,
                (unsigned)adapters[i].id,
                adapters[i].mac_address,
-               adapters[i].name,
+               display_bt_name(adapters[i].name),
                adapters[i].flags,
                adapters[i].type);
     }
@@ -53,7 +85,7 @@ static int run_bluetooth(const InstrumentAPI* const api) {
         printf("  [%u] mac=%s name=%s class=%u/%u/%u major=%u\n",
                i,
                devices[i].mac_address,
-               devices[i].name,
+               display_bt_name(devices[i].name),
                devices[i].dev_class[0],
                devices[i].dev_class[1],
                devices[i].dev_class[2],
@@ -122,8 +154,53 @@ static int run_gps(const InstrumentAPI* const api) {
     return 0;
 }
 
+static void log_link_discovered(const BratislavaLink* link) {
+    printf("Link discovered: id=%s dev=%s type=%u instrument=%u socket=%d\n",
+           link->linkID,
+           link->devID,
+           (unsigned)link->linkType,
+           (unsigned)link->instrumentType,
+           link->socketFd);
+}
+
+static int run_comms(const InstrumentAPI* const api) {
+    LinkDiscoveredCallback callback = log_link_discovered;
+    instrument_api_status_t status =
+        api->registerCallback(INSTRUMENT_COMMS, LINK_DISCOVERED, (InstrumentInputType)&callback);
+    if (status != INSTRUMENT_API_SUCCESS) {
+        fprintf(stderr, "Comms callback registration failed: %d\n", status);
+        return 1;
+    }
+
+    printf("Waiting 10 seconds for Wi-Fi/Bluetooth link handshakes...\n");
+    sleep(10);
+
+    BratislavaLink* links[COMMS_MAX_LINKS];
+    uint32_t link_count = 0U;
+    status = api->instrumentAction(INSTRUMENT_COMMS_DISCOVER_BRATISLAVA_LINKS, NULL, 0U, links, &link_count);
+    if (status != INSTRUMENT_API_SUCCESS) {
+        fprintf(stderr, "Comms link discovery failed: %d\n", status);
+        api->unregisterCallback(INSTRUMENT_COMMS, LINK_DISCOVERED, (InstrumentInputType)&callback);
+        return 1;
+    }
+
+    printf("Active comms links: %" PRIu32 "\n", link_count);
+    for (uint32_t i = 0U; i < link_count; ++i) {
+        printf("  [%u] id=%s dev=%s instrument=%u socket=%d\n",
+               i,
+               links[i]->linkID,
+               links[i]->devID,
+               (unsigned)links[i]->instrumentType,
+               links[i]->socketFd);
+    }
+
+    api->unregisterCallback(INSTRUMENT_COMMS, LINK_DISCOVERED, (InstrumentInputType)&callback);
+    return 0;
+}
+
 int main(int argc, char** argv) {
-    if (argc != 2) {
+    HarnessWifiMode wifi_mode;
+    if (!parse_wifi_mode(argc, argv, &wifi_mode)) {
         usage(argv[0]);
         return 1;
     }
@@ -142,6 +219,10 @@ int main(int argc, char** argv) {
         rc = run_wifi(api);
     } else if (strcmp(argv[1], "gps") == 0) {
         rc = run_gps(api);
+    } else if (strcmp(argv[1], "comms") == 0) {
+        rc = run_comms(api);
+    } else if (strcmp(argv[1], "link-callback") == 0) {
+        rc = run_link_callback_harness(api, 2U, wifi_mode);
     } else {
         usage(argv[0]);
     }

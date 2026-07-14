@@ -27,11 +27,13 @@ else()
 endif()
 
 add_library(sensor-lib STATIC
+    src/comms_runtime.cpp
     src/instrument_api.c
     src/wifi_scanner_bridge.cpp
 )
 
 add_library(sensor-lib-shared SHARED
+    src/comms_runtime.cpp
     src/instrument_api.c
     src/wifi_scanner_bridge.cpp
 )
@@ -73,11 +75,13 @@ target_compile_options(sensor-lib PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(sensor-lib-shared PRIVATE -Wall -Wextra -Wpedantic)
 target_link_directories(sensor-lib PRIVATE ${SENSOR_LIB_WIFI_LIBRARY_DIRS})
 target_link_directories(sensor-lib-shared PRIVATE ${SENSOR_LIB_WIFI_LIBRARY_DIRS})
-target_link_libraries(sensor-lib PUBLIC bluetooth ${SENSOR_LIB_WIFI_LIBRARIES})
-target_link_libraries(sensor-lib-shared PUBLIC bluetooth ${SENSOR_LIB_WIFI_LIBRARIES})
+find_package(Threads REQUIRED)
+target_link_libraries(sensor-lib PUBLIC bluetooth ${SENSOR_LIB_WIFI_LIBRARIES} Threads::Threads)
+target_link_libraries(sensor-lib-shared PUBLIC bluetooth ${SENSOR_LIB_WIFI_LIBRARIES} Threads::Threads)
 set_target_properties(sensor-lib-shared PROPERTIES OUTPUT_NAME sensor-lib)
 
 add_executable(instrument-cli
+    tests/link_callback_harness.c
     tests/instrument_cli.c
 )
 
@@ -88,3 +92,10 @@ add_executable(repeat-sensing-test
 )
 
 target_link_libraries(repeat-sensing-test PRIVATE sensor-lib)
+
+add_executable(link-callback-test
+    tests/link_callback_harness.c
+    tests/link_callback_test.c
+)
+
+target_link_libraries(link-callback-test PRIVATE sensor-lib)

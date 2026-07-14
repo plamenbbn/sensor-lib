@@ -35,8 +35,22 @@ The implemented actions are:
 - `INSTRUMENT_WIFI_SCAN_ON`
 - `INSTRUMENT_WIFI_SCAN_OFF`
 - `INSTRUMENT_GPS_GET_POSITION`
+- `INSTRUMENT_BLUETOOTH_DISCOVER_BRATISLAVA_LINKS`
+- `INSTRUMENT_WIFI_DISCOVER_BRATISLAVA_LINKS`
+- `INSTRUMENT_COMMS_DISCOVER_BRATISLAVA_LINKS`
 
-Callback registration and several other instrument types are currently stubbed and return `INSTRUMENT_API_NOT_SUPPORTED`.
+The implemented callback path now includes:
+
+- `registerCallback(INSTRUMENT_COMMS, LINK_DISCOVERED, ...)`
+- `registerCallback(INSTRUMENT_COMMS, LINK_DROPPED, ...)`
+- `registerCallback(INSTRUMENT_BLUETOOTH, DEVICE_DISCOVERED, ...)`
+- `registerCallback(INSTRUMENT_WIFI, DEVICE_DISCOVERED, ...)`
+
+When the API is created, a background comms runtime starts a Bluetooth L2CAP server and a Wi-Fi UDP server. The
+runtime scans for Bluetooth peers and Wi-Fi ARP neighbors, attempts the `packet-comms` style `Hello Pi World` /
+`Hello Back from ...` handshake, and publishes a `BratislavaLink` with an established socket fd when the handshake
+completes. The dedicated link-callback harness runs indefinitely until interrupted and prints a per-iteration status
+summary after each scan-and-connect cycle.
 
 ## Repository Layout
 
@@ -231,6 +245,9 @@ The simplest way to exercise the implemented actions is the CLI tool:
 ./build/instrument-cli bluetooth
 ./build/instrument-cli wifi
 ./build/instrument-cli gps
+./build/instrument-cli comms
+./build/instrument-cli link-callback
+./build/link-callback-test
 ./build/repeat-sensing-test
 ./build/repeat-sensing-test 50
 ```
