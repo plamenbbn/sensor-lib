@@ -30,12 +30,20 @@ add_library(sensor-lib STATIC
     src/comms_runtime.cpp
     src/instrument_api.c
     src/wifi_scanner_bridge.cpp
+    bratislava-socket/src/BratislavaSocket.cc
+    bratislava-socket/src/BratislavaSocketRegistry.cc
+    bratislava-socket/src/adapters/bluetooth/BluetoothAdapter.cc
+    bratislava-socket/src/adapters/wifi/WifiAdapter.cc
 )
 
 add_library(sensor-lib-shared SHARED
     src/comms_runtime.cpp
     src/instrument_api.c
     src/wifi_scanner_bridge.cpp
+    bratislava-socket/src/BratislavaSocket.cc
+    bratislava-socket/src/BratislavaSocketRegistry.cc
+    bratislava-socket/src/adapters/bluetooth/BluetoothAdapter.cc
+    bratislava-socket/src/adapters/wifi/WifiAdapter.cc
 )
 
 if(SENSOR_LIB_BLUETOOTH_SCANNER STREQUAL "bluez")
@@ -55,15 +63,19 @@ target_sources(sensor-lib-shared PRIVATE ${SENSOR_LIB_BLUETOOTH_SCANNER_SOURCE})
 
 target_include_directories(sensor-lib
     PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/bratislava-socket/include
         ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/c
     PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/bratislava-socket/src
         ${SENSOR_LIB_WIFI_INCLUDE_DIRS}
 )
 
 target_include_directories(sensor-lib-shared
     PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/bratislava-socket/include
         ${CMAKE_CURRENT_SOURCE_DIR}/interfaces/c
     PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/bratislava-socket/src
         ${SENSOR_LIB_WIFI_INCLUDE_DIRS}
 )
 
@@ -71,6 +83,8 @@ target_compile_features(sensor-lib PUBLIC c_std_11)
 target_compile_features(sensor-lib-shared PUBLIC c_std_11)
 target_compile_features(sensor-lib PUBLIC cxx_std_17)
 target_compile_features(sensor-lib-shared PUBLIC cxx_std_17)
+target_compile_definitions(sensor-lib PRIVATE DEVICE_BUILD=1)
+target_compile_definitions(sensor-lib-shared PRIVATE DEVICE_BUILD=1)
 target_compile_options(sensor-lib PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(sensor-lib-shared PRIVATE -Wall -Wextra -Wpedantic)
 target_link_directories(sensor-lib PRIVATE ${SENSOR_LIB_WIFI_LIBRARY_DIRS})

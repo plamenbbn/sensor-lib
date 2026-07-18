@@ -1,5 +1,6 @@
 #include "link_callback_harness.h"
 
+#include "BratislavaSocket.h"
 #include "bluetooth_typedef.h"
 #include "callback_typedef.h"
 #include "comms_typedef.h"
@@ -21,7 +22,7 @@ typedef struct {
     char           mac_address[18];
     char           display_name[256];
     bool           callback_seen;
-    int            socket_fd;
+    bool           socket_ready;
 } LinkResultRecord;
 
 static pthread_mutex_t g_link_result_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -199,6 +200,9 @@ static void record_link_success(const BratislavaLink* const link) {
         return;
     }
 
+    BratislavaSocket* const bsock = bratislavaSocket(*link);
+    const bool socket_ready = (bsock != NULL);
+
     const char* mac_address = NULL;
     const char* display_name = NULL;
     switch (link->instrumentType) {
@@ -219,7 +223,7 @@ static void record_link_success(const BratislavaLink* const link) {
         if ((g_link_results[i].instrument_type == link->instrumentType) &&
             (strcmp(g_link_results[i].mac_address, mac_address) == 0)) {
             g_link_results[i].callback_seen = true;
-            g_link_results[i].socket_fd = link->socketFd;
+            g_link_results[i].socket_ready = socket_ready;
             if (g_link_results[i].display_name[0] == '\0') {
                 copy_string(g_link_results[i].display_name, sizeof(g_link_results[i].display_name), display_name);
             }
@@ -235,14 +239,14 @@ static void record_link_success(const BratislavaLink* const link) {
         copy_string(record->mac_address, sizeof(record->mac_address), mac_address);
         copy_string(record->display_name, sizeof(record->display_name), display_name);
         record->callback_seen = true;
-        record->socket_fd = link->socketFd;
+        record->socket_ready = socket_ready;
     }
     pthread_mutex_unlock(&g_link_result_mutex);
 }
 
 static bool find_link_success(const InstrumentType instrument_type,
                               const char* const    mac_address,
-                              int* const           socket_fd_out) {
+                              bool* const          socket_ready_out) {
     bool found = false;
 
     pthread_mutex_lock(&g_link_result_mutex);
@@ -251,8 +255,8 @@ static bool find_link_success(const InstrumentType instrument_type,
             (strcmp(g_link_results[i].mac_address, mac_address) == 0) &&
             g_link_results[i].callback_seen) {
             found = true;
-            if (socket_fd_out != NULL) {
-                *socket_fd_out = g_link_results[i].socket_fd;
+            if (socket_ready_out != NULL) {
+                *socket_ready_out = g_link_results[i].socket_ready;
             }
             break;
         }
@@ -263,6 +267,7 @@ static bool find_link_success(const InstrumentType instrument_type,
 }
 
 static void link_callback_logger(const BratislavaLink* const link) {
+    BratislavaSocket* const bsock = bratislavaSocket(*link);
     const char* mac_address = "";
     const char* display_name = "";
     switch (link->instrumentType) {
@@ -278,25 +283,25 @@ static void link_callback_logger(const BratislavaLink* const link) {
         break;
     }
 
-    printf("LINK_DISCOVERED callback: %s mac=%s name=%s socket=%d\n",
+    printf("LINK_DISCOVERED callback: %s mac=%s name=%s bsock=%p\n",
            instrument_name(link->instrumentType),
            mac_address,
            (link->instrumentType == INSTRUMENT_BLUETOOTH) ? display_bt_name(display_name) : display_name,
-           link->socketFd);
+           (void*)bsock);
     record_link_success(link);
     fflush(stdout);
 }
 
 static void report_bluetooth_devices(const BluetoothDeviceInfoBase* const devices, const uint32_t device_count) {
     for (uint32_t i = 0U; i < device_count; ++i) {
-        int socket_fd = -1;
-        const bool success = find_link_success(INSTRUMENT_BLUETOOTH, devices[i].mac_address, &socket_fd);
+        bool socket_ready = false;
+        const bool success = find_link_success(INSTRUMENT_BLUETOOTH, devices[i].mac_address, &socket_ready);
         printf("  [BT] mac=%s name=%s -> %s",
                devices[i].mac_address,
                display_bt_name(devices[i].name),
                success ? "SUCCESS" : "FAIL");
         if (success) {
-            printf(" socket=%d", socket_fd);
+            printf(" bsock=%s", socket_ready ? "ready" : "missing");
         }
         printf("\n");
     }
@@ -304,14 +309,14 @@ static void report_bluetooth_devices(const BluetoothDeviceInfoBase* const device
 
 static void report_wifi_devices(const WifiDeviceInfoBase* const devices, const uint32_t device_count) {
     for (uint32_t i = 0U; i < device_count; ++i) {
-        int socket_fd = -1;
-        const bool success = find_link_success(INSTRUMENT_WIFI, devices[i].mac_address, &socket_fd);
+        bool socket_ready = false;
+        const bool success = find_link_success(INSTRUMENT_WIFI, devices[i].mac_address, &socket_ready);
         printf("  [WF] mac=%s ssid=%s -> %s",
                devices[i].mac_address,
                devices[i].ssid,
                success ? "SUCCESS" : "FAIL");
         if (success) {
-            printf(" socket=%d", socket_fd);
+            printf(" bsock=%s", socket_ready ? "ready" : "missing");
         }
         printf("\n");
     }

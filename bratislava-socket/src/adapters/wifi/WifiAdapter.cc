@@ -1,803 +1,220 @@
 #include "WifiAdapter.h"
 
-#include <anduril/util/ErrnoToString.h>
-#include <anduril/util/IpAddrFormat.h>
-#include <anduril/util/LogFormatters.h>
-#include <anduril/util/Logger.h>
-
 #include <BratislavaSocketRegistry.h>
 
-#include <string>
-#include <vector>
+#include <cerrno>
+#include <cstring>
+#include <functional>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
-WifiAdapter::WifiAdapter(BratislavaSocket* bsock) : bsock_(bsock), gateway_(nullptr) {
-    wifiDeviceInfo_    = &bsock->link.wifiDeviceInfo;
-    linkTelemetryJSON_ = bsock->link;
-    deviceType_        = GetWifiDeviceType();
-    if (!GetMacAddress(mac_address_, sizeof(mac_address_))) {
-        LOG_ERROR("Unable to get MAC address");
+WifiAdapter::WifiAdapter(BratislavaSocket* bsock) : bsock_(bsock) {
+    wifiDeviceInfo_ = &bsock_->link.wifiDeviceInfo;
+    if (!resolveLocalIp()) {
+        return;
     }
-    if (!GetSSID(ssid_, sizeof(ssid_))) {
-        LOG_ERROR("Unable to get SSID");
-    }
-    CreateConnectionRequestSocket();
-    CreateListeningSocket();
-    CreateSocket();
+    setupAddresses();
+    is_listener_ = std::strcmp(local_ip_, wifiDeviceInfo_->ssid) < 0;
+    createSocket();
+    createListeningSocket();
 }
 
 WifiAdapter::~WifiAdapter() {
-    close(sockfd_request_);
-    close(sockfd_listen_);
-    CloseSocket();
-    LOG_DEBUG("Wi-Fi socket closed.");
-    anduril::telemetry::success(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                anduril::telemetry::EventType::BRATISLAVA_SOCKET_DESTROYED,
-                                linkTelemetryJSON_,
-                                telemetryDeviceType_);
-}
-
-int WifiAdapter::disconn() {
-    connected_ = false;
-    CloseSocket();
-    CreateSocket();
-    if (sockfd_ != -1) {
-        return 0;
-    }
-    return -1;
+    closeListeningSocket();
+    closeSocket();
 }
 
 int WifiAdapter::conn() {
     connected_ = false;
-    LOG_DEBUG("Starting connection process. Device MAC: {}, Timeout: {} ms, Device Type: {}",
-              wifiDeviceInfo_->mac_address,
-              conn_timeout_.count(),
-              deviceType_);
+    closeSocket();
+    closeListeningSocket();
+    createSocket();
+    createListeningSocket();
 
-    auto start_time = std::chrono::steady_clock::now();
-
-    switch (deviceType_) {
-    case WIFI_ROUTER:
-        LOG_DEBUG("Starting ListenForPeer (Server)");
-        remote_port_ = BratislavaSocketRegistry::GetInstance().GetRemotePort(wifiDeviceInfo_->mac_address);
-        SetupLocalAddr();
-        SetupRemoteAddr();
-        ListenForPeer(start_time);
-        break;
-    case WIFI_ADAPTER:
-        LOG_DEBUG("Sending connection request (Client).");
-        BratislavaSocketRegistry::GetInstance().AddLocalPort(wifiDeviceInfo_->mac_address);
-        SetupLocalAddr();
-        if (!SendConnectionRequest(start_time)) {
-            return -1;
-        }
-        SetupRemoteAddr();
-        LOG_DEBUG("Starting ConnectToPeer (Client)");
-        ConnectToPeer(start_time);
-        break;
-    default:
-        LOG_ERROR("[-] Invalid device type when connecting to remote device.");
-    }
-
-    if (!connected_) {
-        LOG_ERROR("Failed to establish connection. Device MAC: {}", wifiDeviceInfo_->mac_address);
-        anduril::telemetry::failure(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                    anduril::telemetry::EventType::BRATISLAVA_SOCKET_CONNECTED,
-                                    linkTelemetryJSON_,
-                                    telemetryDeviceType_,
-                                    "Failed to establish connection");
+    if ((sockfd_ < 0) || (sockfd_listen_ < 0)) {
         return -1;
     }
 
+    if (is_listener_) {
+        configureSocketTimeout(sockfd_listen_, conn_timeout_);
+        if (bind(sockfd_listen_, reinterpret_cast<sockaddr*>(&localAddr_), sizeof(localAddr_)) != 0) {
+            return -1;
+        }
+        if (listen(sockfd_listen_, 1) != 0) {
+            return -1;
+        }
+        sockaddr_in remote_addr{};
+        socklen_t remote_len = sizeof(remote_addr);
+        const int accepted = accept(sockfd_listen_, reinterpret_cast<sockaddr*>(&remote_addr), &remote_len);
+        if (accepted < 0) {
+            return -1;
+        }
+        closeSocket();
+        sockfd_ = accepted;
+        connected_ = true;
+    } else {
+        configureSocketTimeout(sockfd_, conn_timeout_);
+        if (!waitForSocket(sockfd_, POLLOUT, conn_timeout_)) {
+            return -1;
+        }
+        if (connect(sockfd_, reinterpret_cast<sockaddr*>(&remoteAddr_), sizeof(remoteAddr_)) != 0) {
+            return -1;
+        }
+        connected_ = true;
+    }
+
     BratislavaSocketRegistry::GetInstance().Connect(bsock_);
-    ConfigureSocketForComms();
-    LOG_INFO("Connection established. Device MAC: {}", wifiDeviceInfo_->mac_address);
-    anduril::telemetry::success(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                anduril::telemetry::EventType::BRATISLAVA_SOCKET_CONNECTED,
-                                linkTelemetryJSON_,
-                                telemetryDeviceType_);
+    configureSocketForComms();
+    return 0;
+}
+
+int WifiAdapter::disconn() {
+    connected_ = false;
+    if (sockfd_ >= 0) {
+        shutdown(sockfd_, SHUT_RDWR);
+    }
     return 0;
 }
 
 int WifiAdapter::send(const void* buf, size_t len) {
-    if (!BratislavaSocketRegistry::GetInstance().IsConnected(bsock_)) {
-        LOG_DEBUG("Attempted to send message on a disconnected Wi-Fi socket.");
-        anduril::telemetry::failure(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                    anduril::telemetry::EventType::BRATISLAVA_SOCKET_SEND_MESSAGE,
-                                    nlohmann::json{{"length", len}, {"link", linkTelemetryJSON_}},
-                                    telemetryDeviceType_,
-                                    "EPIPE: Bratislava socket is no longer connected.");
+    if (!BratislavaSocketRegistry::GetInstance().IsConnected(bsock_) || (sockfd_ < 0)) {
         errno = EPIPE;
         return -1;
     }
-
-    LOG_DEBUG("Sending Wi-Fi socket message.");
-    const auto status = ::send(sockfd_, buf, len, MSG_NOSIGNAL);
-
-    if (status < 0) {
-        auto errormsg = std::string("Wi-Fi send error: ") + anduril::util::errnoToString();
-        LOG_ERROR(errormsg);
-        anduril::telemetry::failure(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                    anduril::telemetry::EventType::BRATISLAVA_SOCKET_SEND_MESSAGE,
-                                    nlohmann::json{{"length", len}, {"link", linkTelemetryJSON_}},
-                                    telemetryDeviceType_,
-                                    errormsg);
-        return static_cast<int>(status);
-    }
-    anduril::telemetry::success(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                anduril::telemetry::EventType::BRATISLAVA_SOCKET_SEND_MESSAGE,
-                                nlohmann::json{{"length", len}, {"link", linkTelemetryJSON_}},
-                                telemetryDeviceType_);
-    LOG_DEBUG("Wi-Fi socket message sent.");
-    return static_cast<int>(status);
+    return static_cast<int>(::send(sockfd_, buf, len, MSG_NOSIGNAL));
 }
 
 int WifiAdapter::recv(void* buf, size_t len) {
-    if (!BratislavaSocketRegistry::GetInstance().IsConnected(bsock_)) {
-        LOG_DEBUG("Attempted to receive message on a disconnected Wi-Fi socket.");
-        anduril::telemetry::failure(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                    anduril::telemetry::EventType::BRATISLAVA_SOCKET_RECEIVE_MESSAGE,
-                                    nlohmann::json{{"length", len}, {"link", linkTelemetryJSON_}},
-                                    telemetryDeviceType_,
-                                    "EPIPE: Bratislava socket is no longer connected.");
+    if (!BratislavaSocketRegistry::GetInstance().IsConnected(bsock_) || (sockfd_ < 0)) {
         errno = EPIPE;
         return -1;
     }
-
-    LOG_DEBUG("Receiving Wi-Fi socket message.");
-    const auto bytes_read = ::recv(sockfd_, buf, len, MSG_NOSIGNAL);
-
-    if (bytes_read < 0) {
-        int failure_errno = errno;
-        if (errno == ETIMEDOUT || errno == EAGAIN || errno == EWOULDBLOCK) {
-            failure_errno = ETIMEDOUT;
-            LOG_INFO("Bratislava socket timed out while receiving messages.");
-            anduril::telemetry::success(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                        anduril::telemetry::EventType::BRATISLAVA_SOCKET_RECEIVE_MESSAGE,
-                                        nlohmann::json{{"length", len}, {"link", linkTelemetryJSON_}},
-                                        telemetryDeviceType_);
-        } else {
-            std::string errormsg = std::string("Wi-Fi recv error: ") + anduril::util::errnoToString();
-            LOG_ERROR(errormsg);
-            anduril::telemetry::failure(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                        anduril::telemetry::EventType::BRATISLAVA_SOCKET_RECEIVE_MESSAGE,
-                                        nlohmann::json{{"length", len}, {"link", linkTelemetryJSON_}},
-                                        telemetryDeviceType_,
-                                        errormsg);
-        }
-        errno = failure_errno;
-        return static_cast<int>(bytes_read);
-    }
-
-    if (bytes_read == 0) {
-        std::string debugmsg = "Zero read on Wi-Fi socket, connection closed by peer";
-        LOG_DEBUG(debugmsg);
-        anduril::telemetry::failure(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                    anduril::telemetry::EventType::BRATISLAVA_SOCKET_RECEIVE_MESSAGE,
-                                    nlohmann::json{{"length", len}, {"link", linkTelemetryJSON_}},
-                                    telemetryDeviceType_,
-                                    debugmsg);
-        return static_cast<int>(bytes_read);
-    }
-
-    anduril::telemetry::success(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                anduril::telemetry::EventType::BRATISLAVA_SOCKET_RECEIVE_MESSAGE,
-                                nlohmann::json{{"length", bytes_read}, {"link", linkTelemetryJSON_}},
-                                telemetryDeviceType_);
-
-    LOG_DEBUG("Wi-Fi socket message received.");
-    return static_cast<int>(bytes_read);
+    return static_cast<int>(::recv(sockfd_, buf, len, MSG_NOSIGNAL));
 }
 
-int WifiAdapter::setConnTimeout(const unsigned int milliseconds) {
+int WifiAdapter::setConnTimeout(unsigned int milliseconds) {
     conn_timeout_ = std::chrono::milliseconds(milliseconds);
-    anduril::telemetry::success(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                anduril::telemetry::EventType::BRATISLAVA_SOCKET_SET_CONN_TIMEOUT,
-                                linkTelemetryJSON_,
-                                telemetryDeviceType_);
     return 0;
 }
 
-int WifiAdapter::setRecvTimeout(const unsigned int milliseconds) {
+int WifiAdapter::setRecvTimeout(unsigned int milliseconds) {
     recv_timeout_ = std::chrono::milliseconds(milliseconds);
-    if (connected_) {
-        ConfigureSocketForComms();
+    if (sockfd_ >= 0) {
+        configureSocketForComms();
     }
-    anduril::telemetry::success(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                anduril::telemetry::EventType::BRATISLAVA_SOCKET_SET_RECV_TIMEOUT,
-                                linkTelemetryJSON_,
-                                telemetryDeviceType_);
     return 0;
 }
 
-void WifiAdapter::ConfigureSocketForConnection(const int& sockfd, const std::chrono::milliseconds& timeout) {
-    // Set socket to blocking mode
-    const int flags = fcntl(sockfd, F_GETFL, 0);
-    fcntl(sockfd, F_SETFL, flags & ~O_NONBLOCK);
-
-    constexpr int reuse = 1;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0 ||
-        setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0) {
-        LOG_ERROR(std::string("setsockopt error: ") + anduril::util::errnoToString());
-        anduril::telemetry::failure(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                    anduril::telemetry::EventType::BRATISLAVA_SOCKET_SET_CONN_TIMEOUT,
-                                    linkTelemetryJSON_,
-                                    telemetryDeviceType_,
-                                    "Failure configuring socket for connection.");
+void WifiAdapter::interrupt() {
+    if (sockfd_ >= 0) {
+        shutdown(sockfd_, SHUT_RDWR);
     }
-
-    // Set socket timeout
-    struct timeval tv {};
-
-    tv.tv_sec  = timeout.count() / 1000;
-    tv.tv_usec = (timeout.count() % 1000) * 1000;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) < 0 ||
-        setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) < 0) {
-        LOG_ERROR(std::string("setsockopt timeout error: ") + anduril::util::errnoToString());
+    if (sockfd_listen_ >= 0) {
+        shutdown(sockfd_listen_, SHUT_RDWR);
     }
 }
 
-void WifiAdapter::ConfigureSocketForComms() {
-    // Set socket to blocking mode
-    const int flags = fcntl(sockfd_, F_GETFL, 0);
-    fcntl(sockfd_, F_SETFL, flags & ~O_NONBLOCK);
-
-    // Set socket timeout
-    struct timeval recv_delay {};
-
-    recv_delay.tv_sec  = recv_timeout_.count() / 1000;
-    recv_delay.tv_usec = (recv_timeout_.count() % 1000) * 1000;
-    const int status   = setsockopt(sockfd_, SOL_SOCKET, SO_RCVTIMEO, &recv_delay, sizeof(recv_delay));
-    if (status < 0) {
-        LOG_ERROR(std::string("setsockopt reset to default error: ") + anduril::util::errnoToString());
-        anduril::telemetry::failure(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                    anduril::telemetry::EventType::BRATISLAVA_SOCKET_SET_RECV_TIMEOUT,
-                                    linkTelemetryJSON_,
-                                    telemetryDeviceType_,
-                                    "Failure resetting socket timeout for receiving messages.");
-    }
-}
-
-void WifiAdapter::CreateSocket() {
+void WifiAdapter::createSocket() {
     sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd_ < 0) {
-        LOG_ERROR("Failed to create Wi-Fi socket.");
-        anduril::telemetry::failure(anduril::telemetry::EventOwner::SENSOR_INTERFACE_API,
-                                    anduril::telemetry::EventType::BRATISLAVA_SOCKET_CREATED,
-                                    linkTelemetryJSON_,
-                                    telemetryDeviceType_,
-                                    "Failed to create Wi-Fi socket.");
-    }
 }
 
-void WifiAdapter::CloseSocket() {
+void WifiAdapter::createListeningSocket() {
+    sockfd_listen_ = socket(AF_INET, SOCK_STREAM, 0);
+}
+
+void WifiAdapter::closeSocket() {
     if (sockfd_ >= 0) {
         close(sockfd_);
         sockfd_ = -1;
     }
 }
 
-bool WifiAdapter::CreateConnectionRequestSocket() {
-    // Initialize a socket for connection requests
-    sockfd_request_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd_request_ < 0) {
-        LOG_ERROR("Failed to create connection request socket. Error: {}", anduril::util::errnoToString());
-        return false;
+void WifiAdapter::closeListeningSocket() {
+    if (sockfd_listen_ >= 0) {
+        close(sockfd_listen_);
+        sockfd_listen_ = -1;
     }
-    return true;
 }
 
-bool WifiAdapter::CreateListeningSocket() {
-    // Initialize a socket to listen for incoming connections
-    sockfd_listen_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd_listen_ < 0) {
-        LOG_ERROR("Failed to create listening socket. Error: {}", anduril::util::errnoToString());
-        return false;
-    }
-    return true;
+void WifiAdapter::configureSocketTimeout(const int socket_fd, const std::chrono::milliseconds timeout) const {
+    timeval tv{};
+    tv.tv_sec = static_cast<long>(timeout.count() / 1000);
+    tv.tv_usec = static_cast<long>((timeout.count() % 1000) * 1000);
+    (void)setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
-bool WifiAdapter::WaitForSocket(const int& sockfd, const std::chrono::milliseconds timeout) {
-    pollfd pfd{};
-
-    pfd.fd     = sockfd;
-    pfd.events = POLLOUT;
-
-    // Wait for the socket to be ready for writing
-    const int result = poll(&pfd, 1, static_cast<int>(timeout.count()));
-
-    if (result > 0) {
-        if (pfd.revents & POLLOUT) {
-            // Socket is ready
-            return true;
-        }
-    } else if (result == 0) {
-        LOG_DEBUG("WaitForSocket: Poll timed out");
-    } else {
-        LOG_ERROR("WaitForSocket: Poll error: {} ({})", anduril::util::errnoToString(), errno);
-    }
-
-    return false;
+void WifiAdapter::configureSocketForComms() const {
+    configureSocketTimeout(sockfd_, recv_timeout_);
 }
 
-bool WifiAdapter::SendConnectionRequest(const std::chrono::time_point<std::chrono::steady_clock>& start_time) {
-    constexpr int MAX_RETRIES  = 5;
-    int           retry_count  = 0;
-    bool          is_connected = false;
-
-    // Get IP address of the router
-    if (GetAccessPointIP() < 0) {
-        LOG_DEBUG("Unable to set remote address for access point");
+bool WifiAdapter::resolveLocalIp() {
+    if ((wifiDeviceInfo_ == nullptr) || (wifiDeviceInfo_->ssid[0] == '\0')) {
+        errno = EDESTADDRREQ;
         return false;
     }
 
-    // Configure remote request address for connection requests
-    struct sockaddr_in remoteRequestAddr {};
-
-    memset(&remoteRequestAddr, 0, sizeof(remoteRequestAddr));
-    remoteRequestAddr.sin_family = AF_INET;
-    remoteRequestAddr.sin_port   = htons(BRATISLAVA_PORT);
-    if (inet_pton(AF_INET, gateway_, &remoteRequestAddr.sin_addr) != 1) {
-        LOG_ERROR("[-] Invalid IP address format for gateway: {}", gateway_);
+    const int probe_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (probe_fd < 0) {
         return false;
     }
 
-    LOG_DEBUG("Attempting to connect to the server ({}:{})", gateway_, ntohs(remoteRequestAddr.sin_port));
-
-    while (!connected_ && retry_count < MAX_RETRIES) {
-        // Get remaining connection time and configure socket to timeout accordingly
-        std::chrono::milliseconds remaining_time = GetRemainingConnectionTime(start_time);
-        if (remaining_time <= std::chrono::milliseconds(0)) {
-            LOG_INFO("Connection request attempt timed out.");
-            return false;
-        }
-        ConfigureSocketForConnection(sockfd_request_, remaining_time);
-
-        // Wait for socket to become available
-        if (!WaitForSocket(sockfd_request_, remaining_time)) {
-            retry_count++;
-            continue;
-        }
-
-        // Get remaining connection time and configure socket to timeout accordingly
-        remaining_time = GetRemainingConnectionTime(start_time);
-        if (remaining_time <= std::chrono::milliseconds(0)) {
-            LOG_INFO("Connection request attempt timed out.");
-            close(sockfd_request_);
-            return false;
-        }
-        ConfigureSocketForConnection(sockfd_request_, remaining_time);
-
-        // Attempt to connect
-        if (connect(sockfd_request_,
-                    reinterpret_cast<struct sockaddr*>(&remoteRequestAddr),
-                    sizeof(remoteRequestAddr)) == 0) {
-            LOG_DEBUG("Connection request with {}:{} is successful", gateway_, ntohs(remoteRequestAddr.sin_port));
-            is_connected = true;
-            break;
-        }
-
-        // Handle connection status
-        int err = errno;
-        LOG_DEBUG("Connection attempt failed. Error: {} ({})", anduril::util::errnoToString(err), err);
-
-        switch (err) {
-        case EISCONN:
-            LOG_DEBUG("Connection request has already succeeded.");
-            is_connected = true;
-            break;
-        case ECONNREFUSED:
-        case EHOSTUNREACH:
-        case EHOSTDOWN:
-            LOG_DEBUG("Connection failed due to unavailable server, retrying...");
-            break;
-        case EINVAL:
-            LOG_DEBUG("Invalid argument. Retrying...");
-            break;
-        case ETIMEDOUT:
-        case EAGAIN:
-            LOG_INFO("Connection request timed out for remote address: {}:{}", gateway_, remoteRequestAddr.sin_port);
-            return false;
-        default:
-            LOG_ERROR("Unexpected error in connect. Errno: {}", err);
-            return false;
-        }
-
-        if (is_connected) {
-            break;
-        }
-
-        retry_count++;
-
-        // Determine retry backoff time (scaled to be between 0 and remaining_time / 2)
-        remaining_time = GetRemainingConnectionTime(start_time);
-        if (remaining_time <= std::chrono::milliseconds(0)) {
-            LOG_INFO("Connection request attempt timed out during retry.");
-            return false;
-        }
-
-        auto backoff_time = std::min(remaining_time / 2, std::chrono::milliseconds(100 * (1 << retry_count)));
-
-        LOG_DEBUG("Retrying in {} ms. Remaining time: {} ms", backoff_time.count(), remaining_time.count());
-        std::this_thread::sleep_for(backoff_time);
+    sockaddr_in remote{};
+    remote.sin_family = AF_INET;
+    remote.sin_port = htons(9);
+    if (inet_pton(AF_INET, wifiDeviceInfo_->ssid, &remote.sin_addr) != 1) {
+        close(probe_fd);
+        errno = EDESTADDRREQ;
+        return false;
     }
 
-    if (is_connected) {
-        LOG_DEBUG("Connection request socket has connected to the remote server. Sending device information.");
-        if (::send(sockfd_request_, mac_address_, sizeof(mac_address_), MSG_NOSIGNAL) < 0) {
-            LOG_ERROR("[-] Failed to send MAC address");
-            return false;
-        }
-        if (::send(sockfd_request_, ssid_, sizeof(ssid_), MSG_NOSIGNAL) < 0) {
-            LOG_ERROR("[-] Failed to send SSID");
-            return false;
-        }
-
-        const uint8_t network_port = htons(localAddr_.sin_port);
-        if (::send(sockfd_request_, &network_port, sizeof(network_port), MSG_NOSIGNAL) < 0) {
-            LOG_ERROR("[-] Failed to send local port to remote server");
-            return false;
-        }
-
-        std::string localPortString = std::to_string(ntohs(localAddr_.sin_port));
-        LOG_DEBUG("Sent Client MAC: {};  SSID: {}; Port: {}; to the remote server.",
-                  mac_address_,
-                  ssid_,
-                  localPortString);
-
-        if (::recv(sockfd_request_, &remote_port_, sizeof(remote_port_), MSG_NOSIGNAL) <= 0) {
-            LOG_ERROR("[-] Failed to receive port assignment from access point");
-            return false;
-        }
-        remote_port_ = ntohs(remote_port_);
-
-        LOG_DEBUG("Received port assignment for dedicated comms channel: {}", remote_port_);
-
-        if (remote_port_ < 0) {
-            LOG_ERROR("[-] Invalid port assignment for comms channel.");
-            return false;
-        }
-
-        return true;
+    if (connect(probe_fd, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) != 0) {
+        const int saved_errno = errno;
+        close(probe_fd);
+        errno = saved_errno;
+        return false;
     }
 
-    // Failed after MAX_RETRIES attempts
-    LOG_DEBUG("Max retries reached. Giving up on connection attempt.");
-    return false;
+    sockaddr_in local{};
+    socklen_t local_len = sizeof(local);
+    if (getsockname(probe_fd, reinterpret_cast<sockaddr*>(&local), &local_len) != 0) {
+        const int saved_errno = errno;
+        close(probe_fd);
+        errno = saved_errno;
+        return false;
+    }
+
+    close(probe_fd);
+    return inet_ntop(AF_INET, &local.sin_addr, local_ip_, sizeof(local_ip_)) != nullptr;
 }
 
-void WifiAdapter::ConnectToPeer(const std::chrono::time_point<std::chrono::steady_clock>& start_time) {
-    LOG_DEBUG("ConnectToPeer: Configuring socket for connection.");
-    constexpr int MAX_RETRIES = 5;
-    int           retry_count = 0;
-
-    while (retry_count < MAX_RETRIES) {
-        std::chrono::milliseconds remaining_time = GetRemainingConnectionTime(start_time);
-        if (remaining_time <= std::chrono::milliseconds(0)) {
-            LOG_INFO("Connection attempt timed out for peer {}.", wifiDeviceInfo_->mac_address);
-            return;
-        }
-
-        ConfigureSocketForConnection(sockfd_, remaining_time);
-
-        if (!WaitForSocket(sockfd_, remaining_time)) {
-            return;
-        }
-
-        // Get remaining connection time and configure socket to timeout accordingly
-        remaining_time = GetRemainingConnectionTime(start_time);
-        if (remaining_time <= std::chrono::milliseconds(0)) {
-            LOG_INFO("Connection request attempt timed out.");
-            return;
-        }
-        ConfigureSocketForConnection(sockfd_, remaining_time);
-
-        auto        remoteAddrString = anduril::util::ipv4String(remoteAddr_.sin_addr);
-        std::string remotePortString = std::to_string(ntohs(remoteAddr_.sin_port));
-        LOG_DEBUG("ConnectToPeer: Attempting to connect to {}:{}", remoteAddrString, remotePortString);
-
-        if (connect(sockfd_, reinterpret_cast<struct sockaddr*>(&remoteAddr_), sizeof(remoteAddr_)) == 0) {
-            connected_ = true;
-            LOG_DEBUG("Successfully connected to peer: {}:{}", remoteAddrString, remotePortString);
-            return;
-        }
-
-        int err = errno;
-        LOG_DEBUG("Connection attempt failed. Error: {} ({})", anduril::util::errnoToString(err), err);
-
-        switch (err) {
-        case EISCONN:
-            LOG_DEBUG("Already connected to {}:{}", remoteAddrString, remotePortString);
-            return;
-        case ECONNREFUSED:
-        case EHOSTUNREACH:
-        case EHOSTDOWN:
-            LOG_DEBUG("Connection failed due to unavailable server, retrying...");
-            break;
-        case EINVAL:
-            LOG_DEBUG("Invalid argument, retrying...");
-            SetupRemoteAddr();
-            break;
-        case ETIMEDOUT:
-        case EAGAIN:
-            LOG_INFO("Connection attempt timed out for peer: {}:{}", remoteAddrString, remotePortString);
-            return;
-        default:
-            LOG_ERROR("Unexpected error in connect. Errno: {}", err);
-            return;
-        }
-
-        retry_count++;
-
-        remaining_time = GetRemainingConnectionTime(start_time);
-        if (remaining_time <= std::chrono::milliseconds(0)) {
-            LOG_INFO("Connection attempt timed out during retry for peer {}.", wifiDeviceInfo_->mac_address);
-            return;
-        }
-
-        // Calculate backoff time scaled to remaining time
-        auto backoff_time = std::min(remaining_time / 2, // Use at most half of the remaining time
-                                     std::chrono::milliseconds(100 * (1 << retry_count)) // Exponential backoff
-        );
-
-        LOG_DEBUG("Retrying in {} ms. Remaining time: {} ms", backoff_time.count(), remaining_time.count());
-        std::this_thread::sleep_for(backoff_time);
-    }
-
-    LOG_DEBUG("Max retries reached. Giving up on connection attempt to peer {}.", wifiDeviceInfo_->mac_address);
-}
-
-void WifiAdapter::ListenForPeer(const std::chrono::time_point<std::chrono::steady_clock>& start_time) {
-    const std::chrono::milliseconds remaining_time = GetRemainingConnectionTime(start_time);
-    if (remaining_time <= std::chrono::milliseconds(0)) {
-        LOG_INFO("Listen attempt timed out for peer {}.", wifiDeviceInfo_->mac_address);
-        return;
-    }
-    ConfigureSocketForConnection(sockfd_listen_, remaining_time);
-
-    auto        localAddrString = anduril::util::ipv4String(localAddr_.sin_addr);
-    std::string localPortString = std::to_string(ntohs(localAddr_.sin_port));
-    LOG_DEBUG("ListenForPeer: Binding to {}:{}", localAddrString, localPortString);
-
-    if (bind(sockfd_listen_, reinterpret_cast<struct sockaddr*>(&localAddr_), sizeof(localAddr_)) < 0) {
-        LOG_ERROR("Failed to bind listening socket. Error: {}", anduril::util::errnoToString());
-        return;
-    }
-    LOG_DEBUG("ListenForPeer: Bound listening socket.");
-
-    if (listen(sockfd_listen_, BACKLOG) < 0) {
-        LOG_ERROR("Failed to listen on socket. Error: {}", anduril::util::errnoToString());
-        return;
-    }
-
-    LOG_DEBUG("ListenForPeer: Waiting for incoming connections. Timeout: {} ms", conn_timeout_.count());
-
-    struct sockaddr_in remote_addr = {};
-    socklen_t          opt         = sizeof(remote_addr);
-
-    const int client_sock = accept(sockfd_listen_, reinterpret_cast<struct sockaddr*>(&remote_addr), &opt);
-    if (client_sock >= 0) {
-        sockfd_                      = client_sock;
-        connected_                   = true;
-        auto        remoteAddrString = anduril::util::ipv4String(remote_addr.sin_addr);
-        std::string remotePortString = std::to_string(ntohs(remote_addr.sin_port));
-        LOG_DEBUG("Accepted connection from {}:{}. New socket FD: {}", remoteAddrString, remotePortString, client_sock);
-    } else if (errno == ETIMEDOUT || errno == EAGAIN || errno == EWOULDBLOCK) {
-        LOG_INFO("Accept operation timed out. No incoming connections within the timeout period.");
-        close(client_sock);
-    } else {
-        LOG_ERROR("Error in accept: {}. Errno: {}", anduril::util::errnoToString(), errno);
-        close(client_sock);
-    }
-}
-
-void WifiAdapter::SetupLocalAddr() {
-    const int local_port = BratislavaSocketRegistry::GetInstance().GetLocalPort(wifiDeviceInfo_->mac_address);
-    memset(&localAddr_, 0, sizeof(localAddr_));
-    localAddr_.sin_family      = AF_INET;
-    localAddr_.sin_port        = htons(local_port);
+void WifiAdapter::setupAddresses() {
+    std::memset(&localAddr_, 0, sizeof(localAddr_));
+    localAddr_.sin_family = AF_INET;
+    localAddr_.sin_port = htons(portForIdentity(local_ip_));
     localAddr_.sin_addr.s_addr = htonl(INADDR_ANY);
-}
 
-void WifiAdapter::SetupRemoteAddr() {
-    memset(&remoteAddr_, 0, sizeof(remoteAddr_));
+    std::memset(&remoteAddr_, 0, sizeof(remoteAddr_));
     remoteAddr_.sin_family = AF_INET;
-    remoteAddr_.sin_port   = htons(remote_port_);
-
-    if (remote_port_ < 0) {
-        LOG_ERROR("Configured remote address with invalid port: {}", remote_port_);
-    }
-
-    switch (deviceType_) {
-    case WIFI_ADAPTER:
-        if (inet_pton(AF_INET, gateway_, &remoteAddr_.sin_addr) != 1) {
-            LOG_ERROR("[-] Invalid IP address format for gateway: {}", gateway_);
-            return;
-        }
-        break;
-    case WIFI_ROUTER:
-        remoteAddr_.sin_addr.s_addr = inet_addr(GetLocalIP());
-        break;
-    default:
-        LOG_ERROR("[-] Invalid device type when configuring remote address.");
-    }
-
-    auto        remoteAddrString = anduril::util::ipv4String(remoteAddr_.sin_addr);
-    std::string remotePortString = std::to_string(ntohs(remoteAddr_.sin_port));
-    LOG_DEBUG("Remote address set to: {}:{}", remoteAddrString, remotePortString);
+    remoteAddr_.sin_port = htons(portForIdentity(wifiDeviceInfo_->ssid));
+    (void)inet_pton(AF_INET, wifiDeviceInfo_->ssid, &remoteAddr_.sin_addr);
 }
 
-WifiAdapter::NMSafeWrapper<NMClient> WifiAdapter::GetNMClient() {
-    GError*   error  = nullptr;
-    NMClient* client = nm_client_new(nullptr, &error);
-
-    if (!client) {
-        LOG_ERROR("[-] Error: Could not create NMClient: {}", error->message);
-        g_error_free(error);
-        return {};
-    }
-
-    return NMSafeWrapper(client);
+bool WifiAdapter::waitForSocket(const int socket_fd,
+                                const short events,
+                                const std::chrono::milliseconds timeout) const {
+    pollfd pfd{};
+    pfd.fd = socket_fd;
+    pfd.events = events;
+    const int rc = poll(&pfd, 1, static_cast<int>(timeout.count()));
+    return (rc > 0) && ((pfd.revents & events) != 0);
 }
 
-NMDevice* WifiAdapter::GetNMDevice(NMClient* client) {
-    const GPtrArray* devices     = nm_client_get_devices(client);
-    NMDevice*        wifi_device = nullptr;
-
-    for (guint i = 0; i < devices->len; ++i) {
-        auto* device = NM_DEVICE(g_ptr_array_index(devices, i));
-        if (NM_IS_DEVICE_WIFI(device)) {
-            const NMDeviceState state = nm_device_get_state(device);
-            if (state == NM_DEVICE_STATE_ACTIVATED) {
-                return device; // Return immediately if an activated device is found
-            }
-            wifi_device = device;
-        }
-    }
-
-    // Return connected device if found, otherwise disconnected device
-    if (wifi_device)
-        return wifi_device;
-
-    LOG_ERROR("[-] Error: No Wi-Fi device found.");
-    return nullptr;
-}
-
-WifiDeviceType WifiAdapter::GetWifiDeviceType() {
-    auto       client = GetNMClient();
-    const auto device = GetNMDevice(client.Ref());
-    switch (nm_device_wifi_get_mode(NM_DEVICE_WIFI(device))) {
-    case NM_802_11_MODE_UNKNOWN:
-        LOG_ERROR("[-] Error: Unknown Wi-Fi device mode");
-        return WIFI_UNKNOWN;
-    case NM_802_11_MODE_AP:
-        LOG_DEBUG("Wi-Fi Device Mode: Router");
-        return WIFI_ROUTER;
-    case NM_802_11_MODE_ADHOC:
-    case NM_802_11_MODE_INFRA:
-    case NM_802_11_MODE_MESH:
-        LOG_DEBUG("Wi-Fi Device Mode: Adapter");
-        return WIFI_ADAPTER;
-    }
-    return WIFI_UNKNOWN;
-}
-
-std::chrono::milliseconds
-WifiAdapter::GetRemainingConnectionTime(const std::chrono::time_point<std::chrono::steady_clock>& start_time) const {
-    const std::chrono::steady_clock::time_point current_time = std::chrono::steady_clock::now();
-    const auto elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - start_time);
-    const std::chrono::milliseconds remaining_time = conn_timeout_ - elapsed_time;
-    return remaining_time;
-}
-
-const char* WifiAdapter::GetLocalIP() {
-    auto        client  = GetNMClient();
-    const auto  device  = GetNMDevice(client.Ref());
-    const char* ip_addr = nullptr;
-
-    if (NMIPConfig* ip_config = nm_device_get_ip4_config(device)) {
-        const GPtrArray* addresses = nm_ip_config_get_addresses(ip_config);
-        if (addresses && addresses->len > 0) {
-            auto* address = static_cast<NMIPAddress*>(g_ptr_array_index(addresses, 0));
-            ip_addr       = nm_ip_address_get_address(address);
-        }
-    }
-
-    if (!ip_addr) {
-        LOG_ERROR("AP IP address not found.");
-    }
-
-    return ip_addr;
-}
-
-int WifiAdapter::GetAccessPointIP() {
-    auto       client = GetNMClient();
-    const auto device = GetNMDevice(client.Ref());
-
-    // Get the active connection of the Wi-Fi device
-    NMActiveConnection* active_connection = nm_device_get_active_connection(device);
-    if (!active_connection) {
-        LOG_ERROR("Error: No active Wi-Fi connection found.");
-        return -1;
-    }
-
-    // Get the IP configuration of the active connection
-    NMIPConfig* ip_config = nm_active_connection_get_ip4_config(active_connection);
-    if (!ip_config) {
-        LOG_DEBUG("Error: No IPv4 configuration found.");
-        return -1;
-    }
-
-    // Get the gateway (which is typically the access point's IP address)
-    const char* gateway = nm_ip_config_get_gateway(ip_config);
-    if (gateway) {
-        SetGateway(gateway);
-    } else {
-        LOG_ERROR("Error: No gateway IP address found.");
-        return -1;
-    }
-
-    return 0;
-}
-
-void WifiAdapter::SetGateway(const char* gateway) {
-    // Free the old gateway address if it was set
-    if (gateway_) {
-        free(gateway_);
-        gateway_ = nullptr;
-    }
-
-    // Duplicate the input string and store it in the member variable
-    if (gateway) {
-        gateway_ = strdup(gateway); // Allocate and copy the string
-    }
-}
-
-bool WifiAdapter::GetSSID(char* ssid, size_t ssid_size) {
-    if (ssid == nullptr || ssid_size < 256) {
-        LOG_ERROR("Invalid buffer or buffer size");
-        return false;
-    }
-
-    auto       client = GetNMClient();
-    const auto device = GetNMDevice(client.Ref());
-
-    const char*    ssid_str;
-    bool           found = false;
-    NMAccessPoint* access_point =
-        nm_device_wifi_get_access_point_by_path(NM_DEVICE_WIFI(device), nm_device_get_path(device));
-    if (!access_point) {
-        ssid_str = g_get_host_name();
-    } else {
-        GBytes*     ssid_bytes = nm_access_point_get_ssid(access_point);
-        gsize       ssid_len;
-        const auto* ssid_data = static_cast<const guint8*>(g_bytes_get_data(ssid_bytes, &ssid_len));
-        ssid_str              = nm_utils_ssid_to_utf8(ssid_data, ssid_len);
-    }
-
-    if (ssid_str) {
-        strncpy(ssid, ssid_str, ssid_size - 1);
-        ssid[ssid_size - 1] = '\0';
-        found               = true;
-    }
-
-    return found;
-}
-
-bool WifiAdapter::GetMacAddress(char* mac_addr, size_t mac_addr_size) {
-    if (mac_addr == nullptr || mac_addr_size < 18) {
-        LOG_ERROR("Invalid buffer or buffer size");
-        return false;
-    }
-
-    auto       client = GetNMClient();
-    const auto device = GetNMDevice(client.Ref());
-
-    bool found = false;
-    if (const char* hw_addr = nm_device_get_hw_address(device)) {
-        strncpy(mac_addr, hw_addr, mac_addr_size - 1);
-        mac_addr[mac_addr_size - 1] = '\0';
-        found                       = true;
-    }
-
-    return found;
+uint16_t WifiAdapter::portForIdentity(const char* identity) const {
+    constexpr uint16_t kRangeStart = 40000;
+    constexpr uint16_t kRangeSize = 1024;
+    const size_t hash_value = std::hash<std::string>{}(identity != nullptr ? std::string(identity) : std::string());
+    return static_cast<uint16_t>(kRangeStart + (hash_value % kRangeSize));
 }

@@ -1,5 +1,6 @@
 #include "BratislavaSocket.h"
 
+#include "BratislavaSocketCompat.h"
 #include "BratislavaSocketImpl.h"
 
 #include <BratislavaSocketRegistry.h>
@@ -16,9 +17,9 @@
 
 #endif
 
-#include <anduril/util/CharArrayUtils.h>
-#include <anduril/util/Logger.h>
-
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <shared_mutex>
 
@@ -54,6 +55,17 @@ static std::optional<std::unique_lock<std::shared_mutex>> pinUniqueIfExists(Brat
     return std::unique_lock<std::shared_mutex>(bsock->mutex_shared_bsock_);
 }
 
+static std::string deviceIdForLink(const BratislavaLink& link) {
+    switch (link.instrumentType) {
+    case INSTRUMENT_BLUETOOTH:
+        return std::string(link.bluetoothDeviceInfo.mac_address);
+    case INSTRUMENT_WIFI:
+        return std::string(link.wifiDeviceInfo.mac_address);
+    default:
+        return {};
+    }
+}
+
 void bratislavaSocketInit() {
 #ifdef SIM_BUILD
     if (g_use_tcp) {
@@ -65,15 +77,21 @@ void bratislavaSocketInit() {
 }
 
 extern "C" BratislavaSocket* bratislavaSocket(BratislavaLink link) {
-    std::string            ID(link.linkID);
+    const std::string      device_id = deviceIdForLink(link);
     BratislavaSocketConfig blink_config;
+
+    if (device_id.empty()) {
+        LOG_ERROR("Failed to create socket because the link does not include a valid device identifier.");
+        errno = EINVAL;
+        return nullptr;
+    }
 
     // Lock the global mutex to ensure thread-safe socket creation
     std::shared_lock<std::shared_mutex> global_lock_deletion(g_bsock_deletion_mutex);
     std::unique_lock<std::mutex>        global_lock_creation(g_bsock_creation_mutex);
 
-    if (BratislavaSocketRegistry::GetInstance().Exists(ID)) {
-        if (BratislavaSocketRegistry::GetInstance().GetConfig(ID, blink_config)) {
+    if (BratislavaSocketRegistry::GetInstance().Exists(device_id)) {
+        if (BratislavaSocketRegistry::GetInstance().GetConfig(device_id, blink_config)) {
             BratislavaSocket* bsock = blink_config.socket;
             if (bsock) {
                 return bsock;
@@ -131,8 +149,8 @@ extern "C" BratislavaLinkInfo bratislavaGetLinkInfo(const BratislavaLink* blink)
         return linkInfo;
     }
 
-    anduril::util::copyFixedStr(linkInfo.linkID, blink->linkID);
-    anduril::util::copyFixedStr(linkInfo.devID, blink->devID);
+    bratislavaCopyFixed(linkInfo.linkID, blink->linkID);
+    bratislavaCopyFixed(linkInfo.devID, blink->devID);
 
     linkInfo.linkType = blink->linkType;
 

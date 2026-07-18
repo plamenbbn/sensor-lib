@@ -1,5 +1,6 @@
 #include "comms_runtime.h"
 
+#include "BratislavaSocket.h"
 #include "bluetooth_scanner.h"
 #include "comms_typedef.h"
 
@@ -264,29 +265,17 @@ class CommsRuntime {
     }
 
     void stop() {
-        const bool was_running = running_.exchange(false);
+        running_.exchange(false);
         discovery_cv_.notify_all();
 
-        if (was_running) {
-            if (udp_server_thread_.joinable()) {
-                udp_server_thread_.join();
-            }
-            if (bluetooth_server_thread_.joinable()) {
-                bluetooth_server_thread_.join();
-            }
-            if (discovery_thread_.joinable()) {
-                discovery_thread_.join();
-            }
-        } else {
-            if (udp_server_thread_.joinable()) {
-                udp_server_thread_.join();
-            }
-            if (bluetooth_server_thread_.joinable()) {
-                bluetooth_server_thread_.join();
-            }
-            if (discovery_thread_.joinable()) {
-                discovery_thread_.join();
-            }
+        if (udp_server_thread_.joinable()) {
+            udp_server_thread_.join();
+        }
+        if (bluetooth_server_thread_.joinable()) {
+            bluetooth_server_thread_.join();
+        }
+        if (discovery_thread_.joinable()) {
+            discovery_thread_.join();
         }
 
         std::vector<BratislavaLinkInfo> dropped;
@@ -298,9 +287,6 @@ class CommsRuntime {
                 copy_string(info.devID, sizeof(info.devID), link.link.devID);
                 info.linkType = link.link.linkType;
                 dropped.push_back(info);
-                if (link.link.socketFd >= 0) {
-                    close(link.link.socketFd);
-                }
             }
             active_links_.clear();
             active_link_keys_.clear();
@@ -549,11 +535,12 @@ class CommsRuntime {
             return false;
         }
 
+        close(socket_fd);
+
         std::memset(&active_link->link, 0, sizeof(active_link->link));
         active_link->key = std::string("wifi|") + candidate.device.mac_address;
         active_link->link.linkType = LINK_TYPE_BLUE;
         active_link->link.instrumentType = INSTRUMENT_WIFI;
-        active_link->link.socketFd = socket_fd;
         copy_string(active_link->link.linkID, sizeof(active_link->link.linkID), make_link_id("wifi", candidate.device.mac_address));
         copy_string(active_link->link.devID, sizeof(active_link->link.devID), candidate.device.mac_address);
         active_link->link.wifiDeviceInfo = candidate.device;
@@ -599,11 +586,12 @@ class CommsRuntime {
             return false;
         }
 
+        close(socket_fd);
+
         std::memset(&active_link->link, 0, sizeof(active_link->link));
         active_link->key = std::string("bt|") + device.mac_address;
         active_link->link.linkType = LINK_TYPE_GREEN;
         active_link->link.instrumentType = INSTRUMENT_BLUETOOTH;
-        active_link->link.socketFd = socket_fd;
         copy_string(active_link->link.linkID, sizeof(active_link->link.linkID), make_link_id("bt", device.mac_address));
         copy_string(active_link->link.devID, sizeof(active_link->link.devID), device.mac_address);
         active_link->link.bluetoothDeviceInfo = device;
@@ -617,15 +605,18 @@ class CommsRuntime {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!active_link_keys_.insert(active_link.key).second) {
-                if (active_link.link.socketFd >= 0) {
-                    close(active_link.link.socketFd);
-                }
                 return;
             }
 
             active_links_.push_back(std::move(active_link));
             published_link = &active_links_.back().link;
             callback = callbacks_.link_discovered;
+
+            if (bratislavaSocket(*published_link) == nullptr) {
+                active_link_keys_.erase(active_links_.back().key);
+                active_links_.pop_back();
+                return;
+            }
         }
 
         if (callback != nullptr) {

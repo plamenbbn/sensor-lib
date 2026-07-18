@@ -1,5 +1,5 @@
+#include "BratislavaSocket.h"
 #include "instrument_api.h"
-
 #include "bluetooth_typedef.h"
 #include "callback_typedef.h"
 #include "comms_typedef.h"
@@ -155,12 +155,13 @@ static int run_gps(const InstrumentAPI* const api) {
 }
 
 static void log_link_discovered(const BratislavaLink* link) {
-    printf("Link discovered: id=%s dev=%s type=%u instrument=%u socket=%d\n",
+    BratislavaSocket* const bsock = bratislavaSocket(*link);
+    printf("Link discovered: id=%s dev=%s type=%u instrument=%u bsock=%p\n",
            link->linkID,
            link->devID,
            (unsigned)link->linkType,
            (unsigned)link->instrumentType,
-           link->socketFd);
+           (void*)bsock);
 }
 
 static int run_comms(const InstrumentAPI* const api) {
@@ -186,12 +187,13 @@ static int run_comms(const InstrumentAPI* const api) {
 
     printf("Active comms links: %" PRIu32 "\n", link_count);
     for (uint32_t i = 0U; i < link_count; ++i) {
-        printf("  [%u] id=%s dev=%s instrument=%u socket=%d\n",
+        BratislavaSocket* const bsock = bratislavaSocket(*links[i]);
+        printf("  [%u] id=%s dev=%s instrument=%u bsock=%p\n",
                i,
                links[i]->linkID,
                links[i]->devID,
                (unsigned)links[i]->instrumentType,
-               links[i]->socketFd);
+               (void*)bsock);
     }
 
     api->unregisterCallback(INSTRUMENT_COMMS, LINK_DISCOVERED, (InstrumentInputType)&callback);
