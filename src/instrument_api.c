@@ -36,6 +36,21 @@
 #define GPSD_DEFAULT_PORT     2947
 #define GPSD_READ_TIMEOUT_MS  2500U
 
+static InstrumentAPIConfig g_comms_runtime_config = {0};
+static bool g_comms_runtime_initialized = false;
+
+static instrument_api_status_t ensure_comms_runtime(void) {
+    if (g_comms_runtime_initialized) {
+        return INSTRUMENT_API_SUCCESS;
+    }
+
+    const instrument_api_status_t status = comms_runtime_initialize(&g_comms_runtime_config);
+    if (status == INSTRUMENT_API_SUCCESS) {
+        g_comms_runtime_initialized = true;
+    }
+    return status;
+}
+
 static instrument_api_status_t instrument_action_impl(InstrumentActions         action,
                                                       const InstrumentInputType input_data,
                                                       const uint32_t            input_len,
@@ -641,6 +656,9 @@ static instrument_api_status_t instrument_action_impl(const InstrumentActions   
     case INSTRUMENT_BLUETOOTH_DISCOVER_DEVICES:
         return bluetooth_discover_devices(input_data, input_len, output_data, output_len);
     case INSTRUMENT_BLUETOOTH_DISCOVER_BRATISLAVA_LINKS:
+        if (ensure_comms_runtime() != INSTRUMENT_API_SUCCESS) {
+            return INSTRUMENT_API_ERROR;
+        }
         return comms_runtime_discover_links(INSTRUMENT_BLUETOOTH, output_data, output_len);
     case INSTRUMENT_BLUETOOTH_IS_UP:
         return bluetooth_is_up(input_data, input_len, output_data, output_len);
@@ -657,6 +675,9 @@ static instrument_api_status_t instrument_action_impl(const InstrumentActions   
     case INSTRUMENT_WIFI_DISCOVER_DEVICES:
         return wifi_discover_devices(output_data, output_len);
     case INSTRUMENT_WIFI_DISCOVER_BRATISLAVA_LINKS:
+        if (ensure_comms_runtime() != INSTRUMENT_API_SUCCESS) {
+            return INSTRUMENT_API_ERROR;
+        }
         return comms_runtime_discover_links(INSTRUMENT_WIFI, output_data, output_len);
     case INSTRUMENT_WIFI_IS_UP:
         return wifi_is_up(output_data, output_len);
@@ -671,6 +692,9 @@ static instrument_api_status_t instrument_action_impl(const InstrumentActions   
     case INSTRUMENT_GPS_GET_POSITION:
         return gps_get_position(output_data, output_len);
     case INSTRUMENT_COMMS_DISCOVER_BRATISLAVA_LINKS:
+        if (ensure_comms_runtime() != INSTRUMENT_API_SUCCESS) {
+            return INSTRUMENT_API_ERROR;
+        }
         return comms_runtime_discover_links(INSTRUMENT_COMMS, output_data, output_len);
 
     default:
@@ -681,6 +705,14 @@ static instrument_api_status_t instrument_action_impl(const InstrumentActions   
 static instrument_api_status_t register_callback_impl(const InstrumentType            instrument_type,
                                                       const CallbackType              callback_type,
                                                       const InstrumentInputType input_data) {
+    if ((instrument_type == INSTRUMENT_COMMS) ||
+        ((instrument_type == INSTRUMENT_BLUETOOTH) && (callback_type == DEVICE_DISCOVERED)) ||
+        ((instrument_type == INSTRUMENT_WIFI) && (callback_type == DEVICE_DISCOVERED))) {
+        const instrument_api_status_t status = ensure_comms_runtime();
+        if (status != INSTRUMENT_API_SUCCESS) {
+            return status;
+        }
+    }
     return comms_runtime_register_callback(instrument_type, callback_type, input_data);
 }
 
@@ -700,17 +732,16 @@ InstrumentAPI* createInstrumentAPI(const InstrumentAPIConfig config) {
     api->registerCallback   = register_callback_impl;
     api->unregisterCallback = unregister_callback_impl;
     api->interfaceConfig    = config;
-
-    if (comms_runtime_initialize(&config) != INSTRUMENT_API_SUCCESS) {
-        free(api);
-        return NULL;
-    }
+    g_comms_runtime_config = config;
 
     return api;
 }
 
 void destroyInstrumentAPI(InstrumentAPI* const instrumentAPI) {
-    comms_runtime_shutdown();
+    if (g_comms_runtime_initialized) {
+        comms_runtime_shutdown();
+        g_comms_runtime_initialized = false;
+    }
     free(instrumentAPI);
 }
 

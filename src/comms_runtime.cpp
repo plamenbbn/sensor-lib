@@ -11,6 +11,7 @@
 #include <linux/wireless.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -22,6 +23,7 @@
 #include <condition_variable>
 #include <cctype>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -42,15 +44,55 @@ constexpr uint16_t kBluetoothPsm = 0x1001;
 constexpr int kServerPollTimeoutMs = 500;
 constexpr int kClientTimeoutMs = 3000;
 constexpr int kBluetoothScanSeconds = 5;
+constexpr int kStartupCommandTimeoutMs = 250;
 constexpr auto kDiscoveryInterval = std::chrono::seconds(5);
 constexpr const char* kHelloPayload = "Hello Pi World";
 constexpr const char* kReplyPrefix = "Hello Back from ";
 
-bool run_command(const char* command) {
-    if (command == nullptr) {
+bool run_command_with_timeout(const char* command, int timeout_ms) {
+    if ((command == nullptr) || (timeout_ms <= 0)) {
         return false;
     }
-    return system(command) == 0;
+
+    const pid_t child_pid = fork();
+    if (child_pid < 0) {
+        return false;
+    }
+
+    if (child_pid == 0) {
+        execl("/bin/sh", "sh", "-c", command, (char*)nullptr);
+        _exit(127);
+    }
+
+    int status = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t wait_rc = waitpid(child_pid, &status, WNOHANG);
+        if (wait_rc == child_pid) {
+            return WIFEXITED(status) && (WEXITSTATUS(status) == 0);
+        }
+        if ((wait_rc < 0) && (errno != EINTR)) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    (void)kill(child_pid, SIGTERM);
+    for (int i = 0; i < 20; ++i) {
+        const pid_t wait_rc = waitpid(child_pid, &status, WNOHANG);
+        if (wait_rc == child_pid) {
+            return false;
+        }
+        if ((wait_rc < 0) && (errno != EINTR)) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+
+    (void)kill(child_pid, SIGKILL);
+    while ((waitpid(child_pid, &status, 0) < 0) && (errno == EINTR)) {
+    }
+    return false;
 }
 
 struct WifiCandidate {
@@ -380,8 +422,6 @@ class CommsRuntime {
             return INSTRUMENT_API_ERROR;
         }
 
-        scan_once();
-
         auto** output_links = static_cast<BratislavaLink**>(output_data);
         uint32_t count = 0U;
         std::lock_guard<std::mutex> lock(mutex_);
@@ -408,13 +448,23 @@ class CommsRuntime {
 
   private:
     void configure_bluetooth_accept_incoming_connections() {
-        (void)run_command("rfkill unblock bluetooth >/dev/null 2>&1");
-        (void)run_command("btmgmt power on >/dev/null 2>&1");
-        (void)run_command("btmgmt connectable on >/dev/null 2>&1");
-        (void)run_command("btmgmt bondable on >/dev/null 2>&1");
-        (void)run_command("btmgmt pairable on >/dev/null 2>&1");
-        (void)run_command("btmgmt ssp on >/dev/null 2>&1");
-        (void)run_command("printf 'power on\\ndiscoverable on\\npairable on\\nquit\\n' | bluetoothctl >/dev/null 2>&1");
+        (void)run_command_with_timeout("command -v rfkill >/dev/null 2>&1 && rfkill unblock bluetooth >/dev/null 2>&1",
+                                       kStartupCommandTimeoutMs);
+        (void)run_command_with_timeout("command -v btmgmt >/dev/null 2>&1 && btmgmt power on >/dev/null 2>&1",
+                                       kStartupCommandTimeoutMs);
+        (void)run_command_with_timeout(
+            "command -v btmgmt >/dev/null 2>&1 && btmgmt connectable on >/dev/null 2>&1",
+            kStartupCommandTimeoutMs);
+        (void)run_command_with_timeout("command -v btmgmt >/dev/null 2>&1 && btmgmt bondable on >/dev/null 2>&1",
+                                       kStartupCommandTimeoutMs);
+        (void)run_command_with_timeout("command -v btmgmt >/dev/null 2>&1 && btmgmt pairable on >/dev/null 2>&1",
+                                       kStartupCommandTimeoutMs);
+        (void)run_command_with_timeout("command -v btmgmt >/dev/null 2>&1 && btmgmt ssp on >/dev/null 2>&1",
+                                       kStartupCommandTimeoutMs);
+        (void)run_command_with_timeout(
+            "command -v bluetoothctl >/dev/null 2>&1 && "
+            "printf 'power on\\ndiscoverable on\\npairable on\\nquit\\n' | bluetoothctl >/dev/null 2>&1",
+            kStartupCommandTimeoutMs);
     }
 
     void discovery_loop() {

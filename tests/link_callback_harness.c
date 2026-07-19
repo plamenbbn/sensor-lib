@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -21,8 +22,16 @@ typedef struct {
     InstrumentType instrument_type;
     char           mac_address[18];
     char           display_name[256];
+    char           link_id[20];
     bool           callback_seen;
     bool           socket_ready;
+    bool           exchange_started;
+    bool           exchange_completed;
+    bool           worker_running;
+    bool           worker_joined;
+    unsigned       tx_count;
+    unsigned       rx_count;
+    pthread_t      worker;
 } LinkResultRecord;
 
 static pthread_mutex_t g_link_result_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -30,6 +39,15 @@ static LinkResultRecord g_link_results[COMMS_MAX_LINKS * 4];
 static unsigned g_link_result_count = 0U;
 static volatile sig_atomic_t g_stop_requested = 0;
 static const unsigned g_nmcli_timeout_seconds = 15U;
+static const unsigned g_test_message_count = 3U;
+static const unsigned g_message_delay_seconds = 1U;
+static const unsigned g_recv_idle_limit = 4U;
+static const unsigned g_recv_timeout_ms = 1000U;
+
+typedef struct {
+    BratislavaLink link;
+    char           local_node_name[128];
+} LinkWorkerArgs;
 
 typedef struct {
     bool configured;
@@ -66,6 +84,19 @@ static const char* instrument_name(const InstrumentType instrument_type) {
     default:
         return "??";
     }
+}
+
+static void get_local_node_name(char* const buffer, const size_t buffer_size) {
+    if ((buffer == NULL) || (buffer_size == 0U)) {
+        return;
+    }
+
+    if (gethostname(buffer, buffer_size) != 0) {
+        snprintf(buffer, buffer_size, "pid-%ld", (long)getpid());
+        return;
+    }
+
+    buffer[buffer_size - 1U] = '\0';
 }
 
 static const char* display_bt_name(const char* const name) {
@@ -224,6 +255,7 @@ static void record_link_success(const BratislavaLink* const link) {
             (strcmp(g_link_results[i].mac_address, mac_address) == 0)) {
             g_link_results[i].callback_seen = true;
             g_link_results[i].socket_ready = socket_ready;
+            copy_string(g_link_results[i].link_id, sizeof(g_link_results[i].link_id), link->linkID);
             if (g_link_results[i].display_name[0] == '\0') {
                 copy_string(g_link_results[i].display_name, sizeof(g_link_results[i].display_name), display_name);
             }
@@ -238,6 +270,7 @@ static void record_link_success(const BratislavaLink* const link) {
         record->instrument_type = link->instrumentType;
         copy_string(record->mac_address, sizeof(record->mac_address), mac_address);
         copy_string(record->display_name, sizeof(record->display_name), display_name);
+        copy_string(record->link_id, sizeof(record->link_id), link->linkID);
         record->callback_seen = true;
         record->socket_ready = socket_ready;
     }
@@ -266,6 +299,245 @@ static bool find_link_success(const InstrumentType instrument_type,
     return found;
 }
 
+static bool mark_link_exchange_started(const BratislavaLink* const link) {
+    if (link == NULL) {
+        return false;
+    }
+
+    const char* mac_address = NULL;
+    switch (link->instrumentType) {
+    case INSTRUMENT_BLUETOOTH:
+        mac_address = link->bluetoothDeviceInfo.mac_address;
+        break;
+    case INSTRUMENT_WIFI:
+        mac_address = link->wifiDeviceInfo.mac_address;
+        break;
+    default:
+        return false;
+    }
+
+    bool should_start = false;
+    pthread_mutex_lock(&g_link_result_mutex);
+    for (unsigned i = 0U; i < g_link_result_count; ++i) {
+        if ((g_link_results[i].instrument_type == link->instrumentType) &&
+            (strcmp(g_link_results[i].mac_address, mac_address) == 0)) {
+            if (!g_link_results[i].exchange_started) {
+                g_link_results[i].exchange_started = true;
+                should_start = true;
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_link_result_mutex);
+    return should_start;
+}
+
+static void update_link_exchange_state(const BratislavaLink* const link,
+                                       const bool                 completed,
+                                       const unsigned             tx_count,
+                                       const unsigned             rx_count) {
+    if (link == NULL) {
+        return;
+    }
+
+    const char* mac_address = NULL;
+    switch (link->instrumentType) {
+    case INSTRUMENT_BLUETOOTH:
+        mac_address = link->bluetoothDeviceInfo.mac_address;
+        break;
+    case INSTRUMENT_WIFI:
+        mac_address = link->wifiDeviceInfo.mac_address;
+        break;
+    default:
+        return;
+    }
+
+    pthread_mutex_lock(&g_link_result_mutex);
+    for (unsigned i = 0U; i < g_link_result_count; ++i) {
+        if ((g_link_results[i].instrument_type == link->instrumentType) &&
+            (strcmp(g_link_results[i].mac_address, mac_address) == 0)) {
+            g_link_results[i].exchange_completed = completed;
+            g_link_results[i].worker_running = false;
+            g_link_results[i].tx_count = tx_count;
+            g_link_results[i].rx_count = rx_count;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_link_result_mutex);
+}
+
+static void remember_link_worker(const BratislavaLink* const link, const pthread_t worker) {
+    if (link == NULL) {
+        return;
+    }
+
+    const char* mac_address = NULL;
+    switch (link->instrumentType) {
+    case INSTRUMENT_BLUETOOTH:
+        mac_address = link->bluetoothDeviceInfo.mac_address;
+        break;
+    case INSTRUMENT_WIFI:
+        mac_address = link->wifiDeviceInfo.mac_address;
+        break;
+    default:
+        return;
+    }
+
+    pthread_mutex_lock(&g_link_result_mutex);
+    for (unsigned i = 0U; i < g_link_result_count; ++i) {
+        if ((g_link_results[i].instrument_type == link->instrumentType) &&
+            (strcmp(g_link_results[i].mac_address, mac_address) == 0)) {
+            g_link_results[i].worker_running = true;
+            g_link_results[i].worker = worker;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_link_result_mutex);
+}
+
+static void wait_for_link_workers(void) {
+    pthread_t workers[COMMS_MAX_LINKS * 4];
+    unsigned worker_count = 0U;
+
+    pthread_mutex_lock(&g_link_result_mutex);
+    for (unsigned i = 0U; i < g_link_result_count; ++i) {
+        if (g_link_results[i].exchange_started && !g_link_results[i].worker_joined) {
+            workers[worker_count++] = g_link_results[i].worker;
+            g_link_results[i].worker_joined = true;
+        }
+    }
+    pthread_mutex_unlock(&g_link_result_mutex);
+
+    for (unsigned i = 0U; i < worker_count; ++i) {
+        (void)pthread_join(workers[i], NULL);
+    }
+}
+
+static int send_framed_message(BratislavaSocket* const bsock, const char* const message) {
+    const uint32_t message_length = (uint32_t)strlen(message) + 1U;
+
+    if (bratislavaSend(bsock, &message_length, sizeof(message_length)) == -1) {
+        return -1;
+    }
+
+    if (bratislavaSend(bsock, message, message_length) == -1) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int recv_framed_message(BratislavaSocket* const bsock, char** const message_out) {
+    uint32_t message_length = 0U;
+    const int header_rc = bratislavaRecv(bsock, &message_length, sizeof(message_length));
+    if (header_rc <= 0) {
+        if ((header_rc < 0) && (errno == ETIMEDOUT)) {
+            return 0;
+        }
+        return -1;
+    }
+
+    char* const message = (char*)malloc(message_length);
+    if (message == NULL) {
+        errno = ENOMEM;
+        return -1;
+    }
+
+    const int body_rc = bratislavaRecv(bsock, message, message_length);
+    if (body_rc <= 0) {
+        free(message);
+        if ((body_rc < 0) && (errno == ETIMEDOUT)) {
+            return 0;
+        }
+        return -1;
+    }
+
+    message[message_length - 1U] = '\0';
+    *message_out = message;
+    return 1;
+}
+
+static void* link_message_worker(void* const opaque_args) {
+    LinkWorkerArgs* const args = (LinkWorkerArgs*)opaque_args;
+    BratislavaSocket* const bsock = bratislavaSocket(args->link);
+    unsigned tx_count = 0U;
+    unsigned rx_count = 0U;
+    bool completed = false;
+
+    if (bsock == NULL) {
+        fprintf(stderr, "Message test skipped: no BratislavaSocket for link %s\n", args->link.linkID);
+        goto cleanup;
+    }
+
+    (void)bratislavaConnTimeout(bsock, DEFAULT_CONN_TIMEOUT_MS);
+    (void)bratislavaRecvTimeout(bsock, g_recv_timeout_ms);
+
+    if (bratislavaConn(bsock) != 0) {
+        fprintf(stderr, "Message test connect failed for link %s: errno=%d\n", args->link.linkID, errno);
+        goto cleanup_socket;
+    }
+
+    printf("Message test connected: %s link=%s dev=%s\n",
+           instrument_name(args->link.instrumentType),
+           args->link.linkID,
+           args->link.devID);
+    fflush(stdout);
+
+    for (unsigned i = 0U; (i < g_test_message_count) && !g_stop_requested; ++i) {
+        char message[512];
+        snprintf(message,
+                 sizeof(message),
+                 "clear-text test %u/%u from %s pid=%ld over %s to %s",
+                 i + 1U,
+                 g_test_message_count,
+                 args->local_node_name,
+                 (long)getpid(),
+                 instrument_name(args->link.instrumentType),
+                 args->link.devID);
+        printf("TX %s link=%s: %s\n", instrument_name(args->link.instrumentType), args->link.linkID, message);
+        fflush(stdout);
+
+        if (send_framed_message(bsock, message) != 0) {
+            fprintf(stderr, "Message send failed for link %s: errno=%d\n", args->link.linkID, errno);
+            goto cleanup_socket;
+        }
+        ++tx_count;
+
+        sleep(g_message_delay_seconds);
+    }
+
+    unsigned idle_timeouts = 0U;
+    while (!g_stop_requested && (idle_timeouts < g_recv_idle_limit)) {
+        char* message = NULL;
+        const int recv_rc = recv_framed_message(bsock, &message);
+        if (recv_rc > 0) {
+            printf("RX %s link=%s: %s\n", instrument_name(args->link.instrumentType), args->link.linkID, message);
+            fflush(stdout);
+            free(message);
+            ++rx_count;
+            idle_timeouts = 0U;
+            continue;
+        }
+
+        if (recv_rc == 0) {
+            ++idle_timeouts;
+            continue;
+        }
+
+        fprintf(stderr, "Message receive failed for link %s: errno=%d\n", args->link.linkID, errno);
+        goto cleanup_socket;
+    }
+
+    completed = true;
+
+cleanup_socket:
+    bratislavaDestroy(bsock);
+cleanup:
+    update_link_exchange_state(&args->link, completed, tx_count, rx_count);
+    free(args);
+    return NULL;
+}
+
 static void link_callback_logger(const BratislavaLink* const link) {
     BratislavaSocket* const bsock = bratislavaSocket(*link);
     const char* mac_address = "";
@@ -289,6 +561,28 @@ static void link_callback_logger(const BratislavaLink* const link) {
            (link->instrumentType == INSTRUMENT_BLUETOOTH) ? display_bt_name(display_name) : display_name,
            (void*)bsock);
     record_link_success(link);
+
+    if (mark_link_exchange_started(link)) {
+        LinkWorkerArgs* const args = (LinkWorkerArgs*)calloc(1U, sizeof(*args));
+        if (args == NULL) {
+            fprintf(stderr, "Failed to allocate link worker args.\n");
+            fflush(stderr);
+            return;
+        }
+
+        args->link = *link;
+        get_local_node_name(args->local_node_name, sizeof(args->local_node_name));
+
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, link_message_worker, args) != 0) {
+            fprintf(stderr, "Failed to launch message worker for link %s\n", link->linkID);
+            fflush(stderr);
+            update_link_exchange_state(link, false, 0U, 0U);
+            free(args);
+        } else {
+            remember_link_worker(link, worker);
+        }
+    }
     fflush(stdout);
 }
 
@@ -303,6 +597,20 @@ static void report_bluetooth_devices(const BluetoothDeviceInfoBase* const device
         if (success) {
             printf(" bsock=%s", socket_ready ? "ready" : "missing");
         }
+        pthread_mutex_lock(&g_link_result_mutex);
+        for (unsigned j = 0U; j < g_link_result_count; ++j) {
+            if ((g_link_results[j].instrument_type == INSTRUMENT_BLUETOOTH) &&
+                (strcmp(g_link_results[j].mac_address, devices[i].mac_address) == 0)) {
+                if (g_link_results[j].exchange_started) {
+                    printf(" msg-test=started");
+                }
+                if (g_link_results[j].exchange_completed) {
+                    printf(" tx=%u rx=%u", g_link_results[j].tx_count, g_link_results[j].rx_count);
+                }
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_link_result_mutex);
         printf("\n");
     }
 }
@@ -318,6 +626,20 @@ static void report_wifi_devices(const WifiDeviceInfoBase* const devices, const u
         if (success) {
             printf(" bsock=%s", socket_ready ? "ready" : "missing");
         }
+        pthread_mutex_lock(&g_link_result_mutex);
+        for (unsigned j = 0U; j < g_link_result_count; ++j) {
+            if ((g_link_results[j].instrument_type == INSTRUMENT_WIFI) &&
+                (strcmp(g_link_results[j].mac_address, devices[i].mac_address) == 0)) {
+                if (g_link_results[j].exchange_started) {
+                    printf(" msg-test=started");
+                }
+                if (g_link_results[j].exchange_completed) {
+                    printf(" tx=%u rx=%u", g_link_results[j].tx_count, g_link_results[j].rx_count);
+                }
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_link_result_mutex);
         printf("\n");
     }
 }
@@ -419,6 +741,7 @@ int run_link_callback_harness(const InstrumentAPI* const api,
     }
 
     (void)api->unregisterCallback(INSTRUMENT_COMMS, LINK_DISCOVERED, (InstrumentInputType)&callback);
+    wait_for_link_workers();
     restore_wifi_mode(&wifi_mode_state);
     return 0;
 }

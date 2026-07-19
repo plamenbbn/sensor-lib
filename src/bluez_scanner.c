@@ -13,6 +13,7 @@
 #define BLUEZ_SCAN_SECONDS 6U
 #define BLUEZ_SCAN_OUTPUT_MAX (256U * 1024U)
 #define BLUEZ_INFO_OUTPUT_MAX (16U * 1024U)
+#define BLUEZ_COMMAND_TIMEOUT_SECONDS 8U
 
 typedef struct {
     char mac_address[18];
@@ -72,7 +73,14 @@ static bool read_command_output(const char* const command, char* const output, c
         return false;
     }
 
-    FILE* const pipe = popen(command, "r");
+    char wrapped_command[1024];
+    snprintf(wrapped_command,
+             sizeof(wrapped_command),
+             "timeout %us /bin/sh -c '%s'",
+             BLUEZ_COMMAND_TIMEOUT_SECONDS,
+             command);
+
+    FILE* const pipe = popen(wrapped_command, "r");
     if (pipe == NULL) {
         output[0] = '\0';
         return false;

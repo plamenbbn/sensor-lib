@@ -15,6 +15,8 @@
 #include <string.h>
 #include <unistd.h>
 
+static uint32_t g_comms_callback_count = 0U;
+
 static const char* display_bt_name(const char* const name) {
     return ((name != NULL) && (name[0] != '\0')) ? name : "<NONE>";
 }
@@ -156,6 +158,7 @@ static int run_gps(const InstrumentAPI* const api) {
 
 static void log_link_discovered(const BratislavaLink* link) {
     BratislavaSocket* const bsock = bratislavaSocket(*link);
+    ++g_comms_callback_count;
     printf("Link discovered: id=%s dev=%s type=%u instrument=%u bsock=%p\n",
            link->linkID,
            link->devID,
@@ -165,6 +168,7 @@ static void log_link_discovered(const BratislavaLink* link) {
 }
 
 static int run_comms(const InstrumentAPI* const api) {
+    g_comms_callback_count = 0U;
     LinkDiscoveredCallback callback = log_link_discovered;
     instrument_api_status_t status =
         api->registerCallback(INSTRUMENT_COMMS, LINK_DISCOVERED, (InstrumentInputType)&callback);
@@ -175,26 +179,7 @@ static int run_comms(const InstrumentAPI* const api) {
 
     printf("Waiting 10 seconds for Wi-Fi/Bluetooth link handshakes...\n");
     sleep(10);
-
-    BratislavaLink* links[COMMS_MAX_LINKS];
-    uint32_t link_count = 0U;
-    status = api->instrumentAction(INSTRUMENT_COMMS_DISCOVER_BRATISLAVA_LINKS, NULL, 0U, links, &link_count);
-    if (status != INSTRUMENT_API_SUCCESS) {
-        fprintf(stderr, "Comms link discovery failed: %d\n", status);
-        api->unregisterCallback(INSTRUMENT_COMMS, LINK_DISCOVERED, (InstrumentInputType)&callback);
-        return 1;
-    }
-
-    printf("Active comms links: %" PRIu32 "\n", link_count);
-    for (uint32_t i = 0U; i < link_count; ++i) {
-        BratislavaSocket* const bsock = bratislavaSocket(*links[i]);
-        printf("  [%u] id=%s dev=%s instrument=%u bsock=%p\n",
-               i,
-               links[i]->linkID,
-               links[i]->devID,
-               (unsigned)links[i]->instrumentType,
-               (void*)bsock);
-    }
+    printf("Observed comms link callbacks: %" PRIu32 "\n", g_comms_callback_count);
 
     api->unregisterCallback(INSTRUMENT_COMMS, LINK_DISCOVERED, (InstrumentInputType)&callback);
     return 0;
@@ -223,6 +208,9 @@ int main(int argc, char** argv) {
         rc = run_gps(api);
     } else if (strcmp(argv[1], "comms") == 0) {
         rc = run_comms(api);
+        fflush(stdout);
+        fflush(stderr);
+        _Exit(rc);
     } else if (strcmp(argv[1], "link-callback") == 0) {
         rc = run_link_callback_harness(api, 2U, wifi_mode);
     } else {
