@@ -9,13 +9,14 @@
 
 #include <pthread.h>
 #include <signal.h>
-#include <sys/wait.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 typedef struct {
@@ -43,6 +44,8 @@ static const unsigned g_test_message_count = 3U;
 static const unsigned g_message_delay_seconds = 1U;
 static const unsigned g_recv_idle_limit = 4U;
 static const unsigned g_recv_timeout_ms = 1000U;
+static const char* g_default_test_ssid = "sensor-lib-link-callback";
+static const char* g_default_test_password = "sensorlib123";
 
 typedef struct {
     BratislavaLink link;
@@ -73,6 +76,11 @@ static void copy_string(char* const dst, const size_t dst_size, const char* cons
 
     strncpy(dst, src, dst_size - 1U);
     dst[dst_size - 1U] = '\0';
+}
+
+static const char* getenv_or_default(const char* const name, const char* const fallback) {
+    const char* const value = getenv(name);
+    return ((value != NULL) && (value[0] != '\0')) ? value : fallback;
 }
 
 static const char* instrument_name(const InstrumentType instrument_type) {
@@ -130,17 +138,31 @@ static bool run_timed_command(const char* const label, const char* const command
         return false;
     }
 
+    char temp_path[] = "/tmp/sensor-lib-link-callback.XXXXXX";
+    const int temp_fd = mkstemp(temp_path);
+    if (temp_fd >= 0) {
+        close(temp_fd);
+    } else {
+        temp_path[0] = '\0';
+    }
+
     char wrapped_command[2048];
     snprintf(wrapped_command,
              sizeof(wrapped_command),
-             "timeout %us /bin/bash -lc \"%s\" >/dev/null 2>&1",
+             "timeout %us /bin/bash -lc \"%s\"%s%s%s",
              g_nmcli_timeout_seconds,
-             command);
+             command,
+             temp_path[0] != '\0' ? " >" : "",
+             temp_path[0] != '\0' ? temp_path : "",
+             temp_path[0] != '\0' ? " 2>&1" : "");
 
     const int rc = system(wrapped_command);
     if (rc == 0) {
         printf("[wifi-mode] %s: ok\n", label);
         fflush(stdout);
+        if (temp_path[0] != '\0') {
+            (void)unlink(temp_path);
+        }
         return true;
     }
 
@@ -152,6 +174,18 @@ static bool run_timed_command(const char* const label, const char* const command
         fprintf(stderr, "[wifi-mode] %s: failed\n", label);
     }
     fflush(stderr);
+
+    if (temp_path[0] != '\0') {
+        FILE* const temp_file = fopen(temp_path, "r");
+        if (temp_file != NULL) {
+            char line[512];
+            while (fgets(line, sizeof(line), temp_file) != NULL) {
+                fprintf(stderr, "[wifi-mode] %s output: %s", label, line);
+            }
+            fclose(temp_file);
+        }
+        (void)unlink(temp_path);
+    }
 
     return warn_only ? true : false;
 }
@@ -173,9 +207,42 @@ static bool configure_wifi_mode(const HarnessWifiMode wifi_mode, WifiModeState* 
         sizeof(state->previous_connection));
 
     if (wifi_mode == HARNESS_WIFI_MODE_CLIENT) {
+        const char* const ssid = getenv_or_default("SENSOR_LIB_TEST_SSID", g_default_test_ssid);
+        const char* const password = getenv_or_default("SENSOR_LIB_TEST_PASSWORD", g_default_test_password);
+
+        (void)run_timed_command("enable Wi-Fi radio", "nmcli radio wifi on", true);
+        (void)run_timed_command("delete stale client profile", "nmcli connection delete sensor-lib-link-callback-client || true", true);
+
+        char command[1024];
+        snprintf(command,
+                 sizeof(command),
+                 "nmcli device wifi rescan ifname '%s' || true",
+                 state->interface_name);
+        (void)run_timed_command("rescan Wi-Fi", command, true);
+
+        snprintf(command,
+                 sizeof(command),
+                 "nmcli device wifi connect '%s' password '%s' ifname '%s' name sensor-lib-link-callback-client",
+                 ssid,
+                 password,
+                 state->interface_name);
+        if (!run_timed_command("connect to test hotspot", command, false)) {
+            return false;
+        }
+
+        snprintf(command,
+                 sizeof(command),
+                 "gateway=$(ip route show dev '%s' default | awk '/default/ {print $3; exit}'); "
+                 "if [ -n \"$gateway\" ]; then ping -c 2 -W 2 \"$gateway\" >/dev/null 2>&1 || true; fi",
+                 state->interface_name);
+        (void)run_timed_command("prime ARP with gateway ping", command, true);
+
         state->configured = true;
         return true;
     }
+
+    const char* const ssid = getenv_or_default("SENSOR_LIB_TEST_SSID", g_default_test_ssid);
+    const char* const password = getenv_or_default("SENSOR_LIB_TEST_PASSWORD", g_default_test_password);
 
     (void)run_timed_command("enable Wi-Fi radio", "nmcli radio wifi on", true);
     (void)run_timed_command("delete stale hotspot profile", "nmcli connection delete sensor-lib-link-callback-hotspot || true", true);
@@ -184,9 +251,13 @@ static bool configure_wifi_mode(const HarnessWifiMode wifi_mode, WifiModeState* 
     snprintf(command,
              sizeof(command),
              "nmcli device wifi hotspot ifname '%s' con-name sensor-lib-link-callback-hotspot "
-             "ssid sensor-lib-link-callback password sensorlib123",
-             state->interface_name);
-    (void)run_timed_command("start hotspot", command, true);
+             "ssid '%s' password '%s'",
+             state->interface_name,
+             ssid,
+             password);
+    if (!run_timed_command("start hotspot", command, false)) {
+        return false;
+    }
 
     state->configured = true;
     return true;
@@ -197,12 +268,13 @@ static void restore_wifi_mode(const WifiModeState* const state) {
         return;
     }
 
-    if (state->mode != HARNESS_WIFI_MODE_HOTSPOT) {
-        return;
+    if (state->mode == HARNESS_WIFI_MODE_HOTSPOT) {
+        (void)run_timed_command("bring hotspot down", "nmcli connection down sensor-lib-link-callback-hotspot", true);
+        (void)run_timed_command("delete hotspot profile", "nmcli connection delete sensor-lib-link-callback-hotspot", true);
+    } else {
+        (void)run_timed_command("bring client profile down", "nmcli connection down sensor-lib-link-callback-client", true);
+        (void)run_timed_command("delete client profile", "nmcli connection delete sensor-lib-link-callback-client", true);
     }
-
-    (void)run_timed_command("bring hotspot down", "nmcli connection down sensor-lib-link-callback-hotspot", true);
-    (void)run_timed_command("delete hotspot profile", "nmcli connection delete sensor-lib-link-callback-hotspot", true);
 
     if (state->previous_connection[0] != '\0') {
         char command[1024];

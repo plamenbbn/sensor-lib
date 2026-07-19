@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/l2cap.h>
+#include <ifaddrs.h>
 #include <net/if.h>
 #include <linux/wireless.h>
 #include <netdb.h>
@@ -196,6 +197,36 @@ std::string interface_name_from_index(unsigned int interface_index) {
         return {};
     }
     return name;
+}
+
+std::optional<in_addr> local_interface_ipv4(const std::string& interface_name) {
+    if (interface_name.empty()) {
+        return std::nullopt;
+    }
+
+    ifaddrs* addresses = nullptr;
+    if (getifaddrs(&addresses) != 0) {
+        return std::nullopt;
+    }
+
+    std::optional<in_addr> result;
+    for (ifaddrs* entry = addresses; entry != nullptr; entry = entry->ifa_next) {
+        if ((entry->ifa_name == nullptr) || (entry->ifa_addr == nullptr)) {
+            continue;
+        }
+        if (interface_name != entry->ifa_name) {
+            continue;
+        }
+        if (entry->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+
+        result = reinterpret_cast<sockaddr_in*>(entry->ifa_addr)->sin_addr;
+        break;
+    }
+
+    freeifaddrs(addresses);
+    return result;
 }
 
 void set_receive_timeout(int socket_fd, int timeout_ms) {
@@ -554,6 +585,18 @@ class CommsRuntime {
 
         set_receive_timeout(socket_fd, kClientTimeoutMs);
 
+        const auto local_ip = local_interface_ipv4(candidate.interface_name);
+        if (local_ip.has_value()) {
+            sockaddr_in local{};
+            local.sin_family = AF_INET;
+            local.sin_addr = *local_ip;
+            local.sin_port = htons(0);
+            if (bind(socket_fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+                close(socket_fd);
+                return false;
+            }
+        }
+
         sockaddr_in remote{};
         remote.sin_family = AF_INET;
         remote.sin_port = htons(kUdpPort);
@@ -723,6 +766,7 @@ class CommsRuntime {
             }
 
             buffer[static_cast<size_t>(received)] = '\0';
+            unsigned int incoming_ifindex = 0U;
             std::string interface_name;
             for (cmsghdr* control_message = CMSG_FIRSTHDR(&message);
                  control_message != nullptr;
@@ -731,18 +775,41 @@ class CommsRuntime {
                     (control_message->cmsg_type == IP_PKTINFO) &&
                     (control_message->cmsg_len >= CMSG_LEN(sizeof(in_pktinfo)))) {
                     const auto* packet_info_data = reinterpret_cast<const in_pktinfo*>(CMSG_DATA(control_message));
+                    incoming_ifindex = packet_info_data->ipi_ifindex;
                     interface_name = interface_name_from_index(packet_info_data->ipi_ifindex);
                     break;
                 }
             }
 
             const std::string reply = std::string(kReplyPrefix) + local_interface_mac(interface_name);
-            (void)sendto(socket_fd,
-                         reply.data(),
-                         reply.size(),
-                         0,
-                         reinterpret_cast<sockaddr*>(&remote),
-                         message.msg_namelen);
+            char reply_control[CMSG_SPACE(sizeof(in_pktinfo))] = {0};
+            iovec reply_iov{};
+            reply_iov.iov_base = const_cast<char*>(reply.data());
+            reply_iov.iov_len = reply.size();
+
+            msghdr reply_message{};
+            reply_message.msg_name = &remote;
+            reply_message.msg_namelen = message.msg_namelen;
+            reply_message.msg_iov = &reply_iov;
+            reply_message.msg_iovlen = 1;
+
+            if (incoming_ifindex != 0U) {
+                reply_message.msg_control = reply_control;
+                reply_message.msg_controllen = sizeof(reply_control);
+                cmsghdr* const reply_cmsg = CMSG_FIRSTHDR(&reply_message);
+                if (reply_cmsg != nullptr) {
+                    reply_cmsg->cmsg_level = IPPROTO_IP;
+                    reply_cmsg->cmsg_type = IP_PKTINFO;
+                    reply_cmsg->cmsg_len = CMSG_LEN(sizeof(in_pktinfo));
+
+                    auto* const reply_info = reinterpret_cast<in_pktinfo*>(CMSG_DATA(reply_cmsg));
+                    std::memset(reply_info, 0, sizeof(*reply_info));
+                    reply_info->ipi_ifindex = static_cast<int>(incoming_ifindex);
+                    reply_message.msg_controllen = reply_cmsg->cmsg_len;
+                }
+            }
+
+            (void)sendmsg(socket_fd, &reply_message, 0);
         }
 
         close(socket_fd);

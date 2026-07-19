@@ -12,6 +12,10 @@ STARTUP_DELAY=6
 LOG_ROOT=""
 SKIP_BUILD=0
 SKIP_COPY=0
+TEST_SSID="sensor-lib-link-callback"
+TEST_PASSWORD="sensorlib123"
+REMOTE_RECONNECT_TIMEOUT=90
+RUN_ID="dltest-$(date +%Y%m%d-%H%M%S)-$$"
 
 ARTIFACTS=(
   "instrument-cli"
@@ -38,6 +42,10 @@ Options:
   --duration SEC        Timeout for each side of each test run (default: 25)
   --startup-delay SEC   Delay after starting the hotspot side before client start (default: 6)
   --log-root DIR        Directory for run logs (default: build/distributed-link-logs/<timestamp>)
+  --ssid NAME           Hotspot SSID used by the harness (default: sensor-lib-link-callback)
+  --password PASS       Hotspot password used by the harness (default: sensorlib123)
+  --remote-reconnect SEC
+                        Seconds to wait for ssh to the remote host to recover (default: 90)
   --skip-build          Reuse existing build artifacts
   --skip-copy           Do not scp artifacts before testing
   -h, --help            Show this help
@@ -103,6 +111,18 @@ while (($# > 0)); do
       LOG_ROOT="$2"
       shift 2
       ;;
+    --ssid)
+      TEST_SSID="$2"
+      shift 2
+      ;;
+    --password)
+      TEST_PASSWORD="$2"
+      shift 2
+      ;;
+    --remote-reconnect)
+      REMOTE_RECONNECT_TIMEOUT="$2"
+      shift 2
+      ;;
     --skip-build)
       SKIP_BUILD=1
       shift
@@ -153,6 +173,7 @@ echo "Remote host: $REMOTE_HOSTNAME ($REMOTE_HOST)"
 echo "Build dir:   $BUILD_DIR"
 echo "Remote dir:  $REMOTE_DIR"
 echo "Log root:    $LOG_ROOT"
+echo "Test SSID:   $TEST_SSID"
 
 if ((SKIP_BUILD == 0)); then
   echo
@@ -186,6 +207,8 @@ run_local_harness() {
   (
     cd "$BUILD_DIR"
     export LD_LIBRARY_PATH="$BUILD_DIR:${LD_LIBRARY_PATH:-}"
+    export SENSOR_LIB_TEST_SSID="$TEST_SSID"
+    export SENSOR_LIB_TEST_PASSWORD="$TEST_PASSWORD"
     exec stdbuf -oL -eL timeout -s INT "${TEST_DURATION}s" \
       ./instrument-cli link-callback --wifi-mode "$wifi_mode"
   ) >"$logfile" 2>&1 &
@@ -193,23 +216,91 @@ run_local_harness() {
   cleanup_pids+=("$LAST_PID")
 }
 
-run_remote_harness() {
+remote_meta_base() {
+  printf '%s/.sensor-lib-distributed/%s' "$REMOTE_DIR" "$RUN_ID"
+}
+
+wait_for_remote_ssh() {
+  local deadline=$((SECONDS + REMOTE_RECONNECT_TIMEOUT))
+  while ((SECONDS < deadline)); do
+    if ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE_HOST" "true" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 3
+  done
+  return 1
+}
+
+run_remote_harness_detached() {
   local wifi_mode="$1"
   local logfile="$2"
+  local remote_label="$3"
+  local remote_base remote_log remote_status remote_cmd start_cmd
 
-  local remote_cmd
+  remote_base="$(remote_meta_base)"
+  remote_log="${remote_base}/${remote_label}.log"
+  remote_status="${remote_base}/${remote_label}.status"
+
   remote_cmd=$(
     cat <<EOF
 cd $(printf '%q' "$REMOTE_DIR")
 export LD_LIBRARY_PATH=$(printf '%q' "$REMOTE_DIR"):\${LD_LIBRARY_PATH:-}
-exec stdbuf -oL -eL timeout -s INT ${TEST_DURATION}s ./instrument-cli link-callback --wifi-mode $(printf '%q' "$wifi_mode")
+export SENSOR_LIB_TEST_SSID=$(printf '%q' "$TEST_SSID")
+export SENSOR_LIB_TEST_PASSWORD=$(printf '%q' "$TEST_PASSWORD")
+stdbuf -oL -eL timeout -s INT ${TEST_DURATION}s ./instrument-cli link-callback --wifi-mode $(printf '%q' "$wifi_mode")
+rc=\$?
+printf '%s\n' "\$rc" > $(printf '%q' "$remote_status")
+exit "\$rc"
 EOF
   )
 
-  ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE_HOST" "bash -lc $(printf '%q' "$remote_cmd")" \
-    >"$logfile" 2>&1 &
-  LAST_PID="$!"
-  cleanup_pids+=("$LAST_PID")
+  start_cmd=$(
+    cat <<EOF
+mkdir -p $(printf '%q' "$remote_base")
+rm -f $(printf '%q' "$remote_log") $(printf '%q' "$remote_status")
+nohup bash -lc $(printf '%q' "$remote_cmd") > $(printf '%q' "$remote_log") 2>&1 < /dev/null &
+printf '%s\n' "\$!"
+EOF
+  )
+
+  LAST_PID="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE_HOST" "bash -lc $(printf '%q' "$start_cmd")" | tail -n 1)"
+  : >"$logfile"
+}
+
+collect_remote_log() {
+  local remote_label="$1"
+  local logfile="$2"
+  local remote_base remote_log
+  remote_base="$(remote_meta_base)"
+  remote_log="${remote_base}/${remote_label}.log"
+
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE_HOST" "cat $(printf '%q' "$remote_log")" >"$logfile" 2>&1 || true
+}
+
+read_remote_status() {
+  local remote_label="$1"
+  local remote_base remote_status
+  remote_base="$(remote_meta_base)"
+  remote_status="${remote_base}/${remote_label}.status"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE_HOST" "cat $(printf '%q' "$remote_status")" 2>/dev/null | tail -n 1
+}
+
+wait_for_remote_status() {
+  local remote_label="$1"
+  local deadline=$((SECONDS + REMOTE_RECONNECT_TIMEOUT))
+  local status=""
+
+  while ((SECONDS < deadline)); do
+    if wait_for_remote_ssh; then
+      status="$(read_remote_status "$remote_label")"
+      if [[ -n "$status" ]]; then
+        printf '%s' "$status"
+        return 0
+      fi
+    fi
+    sleep 3
+  done
+  return 1
 }
 
 wait_and_capture_rc() {
@@ -242,6 +333,8 @@ run_direction() {
   local hotspot_log="${LOG_ROOT}/${name}.hotspot.log"
   local client_log="${LOG_ROOT}/${name}.client.log"
   local hotspot_pid client_pid hotspot_rc client_rc
+  local remote_hotspot_label="${name}.hotspot"
+  local remote_client_label="${name}.client"
 
   echo
   echo "== $name =="
@@ -251,20 +344,35 @@ run_direction() {
     run_local_harness hotspot "$hotspot_log"
     hotspot_pid="$LAST_PID"
     sleep "$STARTUP_DELAY"
-    run_remote_harness client "$client_log"
+    run_remote_harness_detached client "$client_log" "$remote_client_label"
     client_pid="$LAST_PID"
   else
-    run_remote_harness hotspot "$hotspot_log"
+    run_remote_harness_detached hotspot "$hotspot_log" "$remote_hotspot_label"
     hotspot_pid="$LAST_PID"
     sleep "$STARTUP_DELAY"
     run_local_harness client "$client_log"
     client_pid="$LAST_PID"
   fi
 
-  wait_and_capture_rc "$client_pid"
-  client_rc="$LAST_WAIT_RC"
-  wait_and_capture_rc "$hotspot_pid"
-  hotspot_rc="$LAST_WAIT_RC"
+  if [[ "$hotspot_side" == "local" ]]; then
+    wait_and_capture_rc "$hotspot_pid"
+    hotspot_rc="$LAST_WAIT_RC"
+    if client_rc="$(wait_for_remote_status "$remote_client_label")"; then
+      collect_remote_log "$remote_client_label" "$client_log"
+    else
+      echo "<remote client log/status did not recover within ${REMOTE_RECONNECT_TIMEOUT}s>" >>"$client_log"
+      client_rc="ssh-reconnect-timeout"
+    fi
+  else
+    wait_and_capture_rc "$client_pid"
+    client_rc="$LAST_WAIT_RC"
+    if hotspot_rc="$(wait_for_remote_status "$remote_hotspot_label")"; then
+      collect_remote_log "$remote_hotspot_label" "$hotspot_log"
+    else
+      echo "<remote hotspot log/status did not recover within ${REMOTE_RECONNECT_TIMEOUT}s>" >>"$hotspot_log"
+      hotspot_rc="ssh-reconnect-timeout"
+    fi
+  fi
 
   cleanup_pids=()
 
