@@ -235,8 +235,20 @@ warm_remote_bluetooth_scanner() {
     "cd $(printf '%q' "$REMOTE_DIR") && export LD_LIBRARY_PATH=$(printf '%q' "$REMOTE_DIR"):\${LD_LIBRARY_PATH:-} && timeout 20s stdbuf -oL -eL ./instrument-cli bluetooth >/dev/null 2>&1 || true"
 }
 
+expected_peer_env() {
+  local peer_mac="$1"
+  local peer_name="$2"
+  [[ -n "$peer_mac" ]] || return 0
+  if [[ -n "$peer_name" ]]; then
+    printf '%s=%s' "$peer_mac" "$peer_name"
+  else
+    printf '%s' "$peer_mac"
+  fi
+}
+
 run_local_harness() {
   local logfile="$1"
+  local expected_peer="${2:-}"
 
   (
     cd "$BUILD_DIR"
@@ -245,6 +257,7 @@ run_local_harness() {
     export SENSOR_LIB_LINK_CALLBACK_SKIP_WIFI_SCAN=1
     export SENSOR_LIB_COMMS_SKIP_WIFI=1
     export SENSOR_LIB_COMMS_PREFER_BLUETOOTH=1
+    export SENSOR_LIB_BLUETOOTH_EXPECT_PEERS="$expected_peer"
     exec stdbuf -oL -eL timeout -s INT "${TEST_DURATION}s" \
       ./instrument-cli link-callback
   ) >"$logfile" 2>&1 &
@@ -269,6 +282,7 @@ wait_for_remote_ssh() {
 
 run_remote_harness_detached() {
   local logfile="$1"
+  local expected_peer="${2:-}"
   local remote_base remote_log remote_status remote_cmd start_cmd
 
   remote_base="$(remote_meta_base)"
@@ -283,6 +297,7 @@ export SENSOR_LIB_LINK_CALLBACK_SKIP_WIFI_MODE=1
 export SENSOR_LIB_LINK_CALLBACK_SKIP_WIFI_SCAN=1
 export SENSOR_LIB_COMMS_SKIP_WIFI=1
 export SENSOR_LIB_COMMS_PREFER_BLUETOOTH=1
+export SENSOR_LIB_BLUETOOTH_EXPECT_PEERS=$(printf '%q' "$expected_peer")
 stdbuf -oL -eL timeout -s INT ${TEST_DURATION}s ./instrument-cli link-callback
 rc=\$?
 printf '%s\n' "\$rc" > $(printf '%q' "$remote_status")
@@ -379,11 +394,16 @@ if ((BT_PRIME != 0)); then
   warm_remote_bluetooth_scanner
 fi
 
+LOCAL_BT_MAC="${LOCAL_BT_MAC:-$(get_local_bluetooth_mac)}"
+REMOTE_BT_MAC="${REMOTE_BT_MAC:-$(get_remote_bluetooth_mac)}"
+LOCAL_EXPECTED_BT_PEER="$(expected_peer_env "$REMOTE_BT_MAC" "$REMOTE_HOSTNAME")"
+REMOTE_EXPECTED_BT_PEER="$(expected_peer_env "$LOCAL_BT_MAC" "$LOCAL_HOSTNAME")"
+
 echo
 echo "== Running BT-only distributed link-callback test =="
-run_local_harness "$LOCAL_LOG"
+run_local_harness "$LOCAL_LOG" "$LOCAL_EXPECTED_BT_PEER"
 local_pid="$LAST_PID"
-run_remote_harness_detached "$REMOTE_LOG"
+run_remote_harness_detached "$REMOTE_LOG" "$REMOTE_EXPECTED_BT_PEER"
 
 wait_and_capture_rc "$local_pid"
 local_rc="$LAST_WAIT_RC"

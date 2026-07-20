@@ -15,6 +15,7 @@
 #define BLUEZ_SCAN_OUTPUT_MAX (256U * 1024U)
 #define BLUEZ_INFO_OUTPUT_MAX (16U * 1024U)
 #define BLUEZ_COMMAND_TIMEOUT_SECONDS 8U
+#define BLUEZ_EXPECTED_PEERS_ENV "SENSOR_LIB_BLUETOOTH_EXPECT_PEERS"
 
 typedef struct {
     char mac_address[18];
@@ -279,6 +280,61 @@ static void append_hci_inquiry_devices(BluezScanEntry* const entries, uint32_t* 
     free(buffer);
 }
 
+static void append_expected_devices(BluezScanEntry* const entries, uint32_t* const count) {
+    const char* const value = getenv(BLUEZ_EXPECTED_PEERS_ENV);
+    if ((value == NULL) || (value[0] == '\0')) {
+        return;
+    }
+
+    char* buffer = strdup(value);
+    if (buffer == NULL) {
+        return;
+    }
+
+    char* saveptr = NULL;
+    for (char* token = strtok_r(buffer, ", \t\r\n", &saveptr); token != NULL; token = strtok_r(NULL, ", \t\r\n", &saveptr)) {
+        trim_trailing_whitespace(token);
+        while ((*token != '\0') && isspace((unsigned char)*token)) {
+            ++token;
+        }
+        if (*token == '\0') {
+            continue;
+        }
+
+        char* separator = strchr(token, '=');
+        if (separator != NULL) {
+            *separator = '\0';
+            ++separator;
+            while ((*separator != '\0') && isspace((unsigned char)*separator)) {
+                ++separator;
+            }
+            trim_trailing_whitespace(separator);
+        }
+
+        if (!looks_like_mac(token)) {
+            continue;
+        }
+
+        BluezScanEntry parsed;
+        memset(&parsed, 0, sizeof(parsed));
+        copy_string(parsed.mac_address, sizeof(parsed.mac_address), token);
+        if ((separator != NULL) && (separator[0] != '\0')) {
+            copy_string(parsed.name, sizeof(parsed.name), separator);
+        }
+
+        BluezScanEntry* slot = NULL;
+        if (!find_or_add_entry(entries, count, &parsed, &slot)) {
+            continue;
+        }
+
+        if ((slot->name[0] == '\0') && (parsed.name[0] != '\0')) {
+            copy_string(slot->name, sizeof(slot->name), parsed.name);
+        }
+    }
+
+    free(buffer);
+}
+
 static void parse_class_property(const char* const info_output, BluetoothDeviceInfoBase* const device) {
     const char* class_line = strstr(info_output, "\tClass:");
     if (class_line == NULL) {
@@ -368,6 +424,7 @@ instrument_api_status_t bluetooth_discover_devices_backend(const InstrumentInput
     parse_scan_output(scan_output, discovered, &discovered_count);
     append_known_devices(discovered, &discovered_count);
     append_hci_inquiry_devices(discovered, &discovered_count);
+    append_expected_devices(discovered, &discovered_count);
 
     BluetoothDeviceInfoBase* const devices = (BluetoothDeviceInfoBase*)output_data;
     for (uint32_t i = 0U; i < discovered_count; ++i) {

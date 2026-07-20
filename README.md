@@ -297,6 +297,7 @@ Runner behavior:
 Bluetooth runner notes:
 
 - The Bluetooth path now supports full distributed `LINK_DISCOVERED` callback + `BratislavaSocket` message exchange once peer visibility succeeds.
+- For the dedicated two-host runner, each side now exports `SENSOR_LIB_BLUETOOTH_EXPECT_PEERS` with the other host's Bluetooth MAC and hostname. That makes the remote `sensor-lib` interface show up as a deterministic discovery candidate even when BlueZ passive discovery is flaky on a cold start.
 - The BT runner performs a small priming phase before the harness starts: local + remote classic inquiry (`hcitool inq`), a remote `l2ping` to the local adapter MAC when passwordless `sudo` is available, and a one-shot `instrument-cli bluetooth` warm-up on both hosts. This helps seed both BlueZ and the library's own scanner path on hosts where pure passive discovery is flaky.
 - You can skip that warm-up with `./distributed-bluetooth-link-test.sh --no-bt-prime ...` if you want to test a completely cold discovery path.
 
