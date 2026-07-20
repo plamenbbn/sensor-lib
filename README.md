@@ -274,6 +274,32 @@ Hotspot/client transition notes:
 - If one of those steps times out, the harness logs the specific step that hung and continues running instead of failing fast.
 - Depending on driver and NetworkManager behavior, hotspot mode may fail to come up cleanly on some hosts. In that case, the harness may still be reporting scans from the normal client connection rather than a true AP-mode vantage point.
 
+### Distributed two-host runners
+
+For repeated two-host testing from the repo root, use the distributed runners:
+
+```bash
+./distributed-link-test.sh
+./distributed-link-test.sh brat-44
+./distributed-link-test.sh --duration 50 --startup-delay 10 --remote-reconnect 150 brat-44
+
+./distributed-bluetooth-link-test.sh
+./distributed-bluetooth-link-test.sh brat-44
+./distributed-bluetooth-link-test.sh --remote-dir /home/plamen/sensor-lib-bt-run brat-44
+```
+
+Runner behavior:
+
+- `distributed-link-test.sh` builds, copies artifacts to the peer, then runs the Wi-Fi hotspot/client harness in both directions.
+- `distributed-bluetooth-link-test.sh` builds, copies artifacts to the peer, prepares both hosts for Bluetooth auto-accept, forces the comms runtime into Bluetooth-first / Wi-Fi-skipped mode, then runs the BT-only harness on both hosts at once.
+- Both runners save per-side logs under `build/distributed-link-logs/`.
+
+Bluetooth runner notes:
+
+- The Bluetooth path now supports full distributed `LINK_DISCOVERED` callback + `BratislavaSocket` message exchange once peer visibility succeeds.
+- The BT runner performs a small priming phase before the harness starts: local + remote classic inquiry (`hcitool inq`), a remote `l2ping` to the local adapter MAC when passwordless `sudo` is available, and a one-shot `instrument-cli bluetooth` warm-up on both hosts. This helps seed both BlueZ and the library's own scanner path on hosts where pure passive discovery is flaky.
+- You can skip that warm-up with `./distributed-bluetooth-link-test.sh --no-bt-prime ...` if you want to test a completely cold discovery path.
+
 Example output:
 
 ```text

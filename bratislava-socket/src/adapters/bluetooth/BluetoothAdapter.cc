@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <functional>
 #include <poll.h>
 #include <sys/socket.h>
@@ -31,16 +32,15 @@ BluetoothAdapter::~BluetoothAdapter() {
 
 int BluetoothAdapter::conn() {
     connected_ = false;
-    closeSocket();
-    closeListeningSocket();
-    createSocket();
-    createListeningSocket();
+    const auto reset_sockets = [this]() -> bool {
+        closeSocket();
+        closeListeningSocket();
+        createSocket();
+        createListeningSocket();
+        return (sockfd_ >= 0) && (sockfd_listen_ >= 0);
+    };
 
-    if ((sockfd_ < 0) || (sockfd_listen_ < 0)) {
-        return -1;
-    }
-
-    if (is_listener_) {
+    const auto try_listener = [this]() -> int {
         configureSocketTimeout(sockfd_listen_, conn_timeout_);
         if (bind(sockfd_listen_, reinterpret_cast<sockaddr*>(&localAddr_), sizeof(localAddr_)) != 0) {
             return -1;
@@ -57,15 +57,73 @@ int BluetoothAdapter::conn() {
         closeSocket();
         sockfd_ = accepted;
         connected_ = true;
-    } else {
-        configureSocketTimeout(sockfd_, conn_timeout_);
+        return 0;
+    };
+
+    const auto try_connector = [this]() -> int {
+        const int flags = fcntl(sockfd_, F_GETFL, 0);
+        if (flags < 0) {
+            return -1;
+        }
+
+        if (fcntl(sockfd_, F_SETFL, flags | O_NONBLOCK) != 0) {
+            return -1;
+        }
+
+        const int connect_rc = connect(sockfd_, reinterpret_cast<sockaddr*>(&remoteAddr_), sizeof(remoteAddr_));
+        if ((connect_rc != 0) && (errno != EINPROGRESS)) {
+            (void)fcntl(sockfd_, F_SETFL, flags);
+            return -1;
+        }
+
         if (!waitForSocket(sockfd_, POLLOUT, conn_timeout_)) {
+            (void)fcntl(sockfd_, F_SETFL, flags);
+            errno = ETIMEDOUT;
             return -1;
         }
-        if (connect(sockfd_, reinterpret_cast<sockaddr*>(&remoteAddr_), sizeof(remoteAddr_)) != 0) {
+
+        int socket_error = 0;
+        socklen_t socket_error_len = sizeof(socket_error);
+        if ((getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len) != 0) || (socket_error != 0)) {
+            (void)fcntl(sockfd_, F_SETFL, flags);
+            errno = (socket_error != 0) ? socket_error : errno;
             return -1;
         }
+
+        if (fcntl(sockfd_, F_SETFL, flags) != 0) {
+            return -1;
+        }
+
         connected_ = true;
+        return 0;
+    };
+
+    if (!reset_sockets()) {
+        return -1;
+    }
+
+    const auto try_preferred = [this, &try_listener, &try_connector]() -> int {
+        return is_listener_ ? try_listener() : try_connector();
+    };
+
+    const auto try_alternate = [this, &try_listener, &try_connector]() -> int {
+        return is_listener_ ? try_connector() : try_listener();
+    };
+
+    if (try_preferred() != 0) {
+        const int first_errno = errno;
+        connected_ = false;
+
+        if (!reset_sockets()) {
+            return -1;
+        }
+
+        if (try_alternate() != 0) {
+            if (errno == 0) {
+                errno = first_errno;
+            }
+            return -1;
+        }
     }
 
     BratislavaSocketRegistry::GetInstance().Connect(bsock_);
@@ -156,7 +214,6 @@ void BluetoothAdapter::configureSocketForComms() const {
 bool BluetoothAdapter::loadLocalAddress() {
     std::memset(&localAddr_, 0, sizeof(localAddr_));
     localAddr_.l2_family = AF_BLUETOOTH;
-    localAddr_.l2_psm = htobs(portForMac(btDeviceInfo_->mac_address));
 
     const int dev_id = hci_get_route(nullptr);
     if (dev_id < 0) {
@@ -169,6 +226,11 @@ bool BluetoothAdapter::loadLocalAddress() {
 
     const int rc = hci_read_bd_addr(hci_socket, &localAddr_.l2_bdaddr, 1000);
     close(hci_socket);
+    if (rc == 0) {
+        char local_mac[18] = {0};
+        ba2str(&localAddr_.l2_bdaddr, local_mac);
+        localAddr_.l2_psm = htobs(portForMac(local_mac));
+    }
     return rc == 0;
 }
 

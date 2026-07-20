@@ -23,9 +23,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cctype>
+#include <cstdarg>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -49,6 +51,52 @@ constexpr int kStartupCommandTimeoutMs = 250;
 constexpr auto kDiscoveryInterval = std::chrono::seconds(5);
 constexpr const char* kHelloPayload = "Hello Pi World";
 constexpr const char* kReplyPrefix = "Hello Back from ";
+
+bool comms_debug_enabled() {
+    static const bool enabled = []() {
+        const char* const value = std::getenv("SENSOR_LIB_COMMS_DEBUG");
+        return (value != nullptr) && (value[0] != '\0') && (std::strcmp(value, "0") != 0);
+    }();
+    return enabled;
+}
+
+bool prefer_bluetooth_first() {
+    static const bool enabled = []() {
+        const char* const value = std::getenv("SENSOR_LIB_COMMS_PREFER_BLUETOOTH");
+        return (value != nullptr) && (value[0] != '\0') && (std::strcmp(value, "0") != 0);
+    }();
+    return enabled;
+}
+
+bool skip_wifi_comms_scan() {
+    static const bool enabled = []() {
+        const char* const value = std::getenv("SENSOR_LIB_COMMS_SKIP_WIFI");
+        return (value != nullptr) && (value[0] != '\0') && (std::strcmp(value, "0") != 0);
+    }();
+    return enabled;
+}
+
+bool skip_bluetooth_comms_scan() {
+    static const bool enabled = []() {
+        const char* const value = std::getenv("SENSOR_LIB_COMMS_SKIP_BLUETOOTH");
+        return (value != nullptr) && (value[0] != '\0') && (std::strcmp(value, "0") != 0);
+    }();
+    return enabled;
+}
+
+void comms_debug(const char* const format, ...) {
+    if (!comms_debug_enabled()) {
+        return;
+    }
+
+    std::fprintf(stderr, "[comms-debug] ");
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
 
 bool run_command_with_timeout(const char* command, int timeout_ms) {
     if ((command == nullptr) || (timeout_ms <= 0)) {
@@ -187,6 +235,42 @@ std::string local_interface_mac(const std::string& interface_name) {
     return normalize_mac(trim_copy(mac_address));
 }
 
+std::string arp_mac_for_ip(const std::string& interface_name, const std::string& ip_address) {
+    if (interface_name.empty() || ip_address.empty()) {
+        return {};
+    }
+
+    std::ifstream input("/proc/net/arp");
+    if (!input) {
+        return {};
+    }
+
+    std::string line;
+    std::getline(input, line);
+    while (std::getline(input, line)) {
+        std::istringstream parser(line);
+        std::string arp_ip_address;
+        std::string hw_type;
+        std::string flags;
+        std::string mac_address;
+        std::string mask;
+        std::string arp_interface_name;
+        if (!(parser >> arp_ip_address >> hw_type >> flags >> mac_address >> mask >> arp_interface_name)) {
+            continue;
+        }
+        if ((arp_ip_address != ip_address) || (arp_interface_name != interface_name)) {
+            continue;
+        }
+        mac_address = normalize_mac(mac_address);
+        if (mac_address == "00:00:00:00:00:00") {
+            return {};
+        }
+        return mac_address;
+    }
+
+    return {};
+}
+
 std::string interface_name_from_index(unsigned int interface_index) {
     if (interface_index == 0U) {
         return {};
@@ -302,6 +386,10 @@ std::vector<WifiCandidate> discover_wifi_candidates() {
         candidate.device.rssi.valid = false;
         copy_string(candidate.device.mac_address, sizeof(candidate.device.mac_address), mac_address);
         copy_string(candidate.device.ssid, sizeof(candidate.device.ssid), ip_address);
+        comms_debug("wifi candidate: if=%s ip=%s mac=%s",
+                    candidate.interface_name.c_str(),
+                    candidate.ip_address.c_str(),
+                    candidate.device.mac_address);
         candidates.push_back(candidate);
     }
 
@@ -507,8 +595,22 @@ class CommsRuntime {
     }
 
     void scan_once() {
-        scan_bluetooth_links();
-        scan_wifi_links();
+        if (prefer_bluetooth_first()) {
+            if (!skip_bluetooth_comms_scan()) {
+                scan_bluetooth_links();
+            }
+            if (!skip_wifi_comms_scan()) {
+                scan_wifi_links();
+            }
+            return;
+        }
+
+        if (!skip_wifi_comms_scan()) {
+            scan_wifi_links();
+        }
+        if (!skip_bluetooth_comms_scan()) {
+            scan_bluetooth_links();
+        }
     }
 
     void scan_bluetooth_links() {
@@ -578,8 +680,13 @@ class CommsRuntime {
     }
 
     bool attempt_wifi_handshake(const WifiCandidate& candidate, ActiveLink* active_link) {
+        comms_debug("attempt wifi handshake start: if=%s ip=%s mac=%s",
+                    candidate.interface_name.c_str(),
+                    candidate.ip_address.c_str(),
+                    candidate.device.mac_address);
         const int socket_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
         if (socket_fd < 0) {
+            comms_debug("attempt wifi handshake socket() failed: errno=%d", errno);
             return false;
         }
 
@@ -592,38 +699,59 @@ class CommsRuntime {
             local.sin_addr = *local_ip;
             local.sin_port = htons(0);
             if (bind(socket_fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+                comms_debug("attempt wifi handshake bind(%s) failed: errno=%d",
+                            candidate.interface_name.c_str(),
+                            errno);
                 close(socket_fd);
                 return false;
             }
+            char local_buffer[INET_ADDRSTRLEN] = {0};
+            (void)inet_ntop(AF_INET, &local.sin_addr, local_buffer, sizeof(local_buffer));
+            comms_debug("attempt wifi handshake bound local ip=%s", local_buffer);
+        } else {
+            comms_debug("attempt wifi handshake no local IPv4 for if=%s", candidate.interface_name.c_str());
         }
 
         sockaddr_in remote{};
         remote.sin_family = AF_INET;
         remote.sin_port = htons(kUdpPort);
         if (inet_pton(AF_INET, candidate.ip_address.c_str(), &remote.sin_addr) != 1) {
+            comms_debug("attempt wifi handshake inet_pton failed for ip=%s", candidate.ip_address.c_str());
             close(socket_fd);
             return false;
         }
 
         if (connect(socket_fd, reinterpret_cast<sockaddr*>(&remote), sizeof(remote)) != 0) {
+            comms_debug("attempt wifi handshake connect(%s:%u) failed: errno=%d",
+                        candidate.ip_address.c_str(),
+                        (unsigned)kUdpPort,
+                        errno);
             close(socket_fd);
             return false;
         }
+        comms_debug("attempt wifi handshake connected remote=%s:%u",
+                    candidate.ip_address.c_str(),
+                    (unsigned)kUdpPort);
 
         if (send(socket_fd, kHelloPayload, std::strlen(kHelloPayload), 0) < 0) {
+            comms_debug("attempt wifi handshake send failed: errno=%d", errno);
             close(socket_fd);
             return false;
         }
+        comms_debug("attempt wifi handshake sent hello");
 
         char buffer[512] = {0};
         const ssize_t received = recv(socket_fd, buffer, sizeof(buffer) - 1, 0);
         if (received <= 0) {
+            comms_debug("attempt wifi handshake recv failed/empty: rc=%zd errno=%d", received, errno);
             close(socket_fd);
             return false;
         }
         buffer[received] = '\0';
+        comms_debug("attempt wifi handshake received reply='%s'", buffer);
 
         if (!starts_with_reply_prefix(buffer)) {
+            comms_debug("attempt wifi handshake reply prefix mismatch");
             close(socket_fd);
             return false;
         }
@@ -688,6 +816,68 @@ class CommsRuntime {
         copy_string(active_link->link.linkID, sizeof(active_link->link.linkID), make_link_id("bt", device.mac_address));
         copy_string(active_link->link.devID, sizeof(active_link->link.devID), device.mac_address);
         active_link->link.bluetoothDeviceInfo = device;
+        return true;
+    }
+
+    bool publish_incoming_bluetooth_link(const std::string& mac_address, const std::string& name) {
+        if (mac_address.empty()) {
+            comms_debug("incoming bluetooth link publish skipped: empty mac");
+            return false;
+        }
+
+        ActiveLink active_link;
+        std::memset(&active_link.link, 0, sizeof(active_link.link));
+        active_link.key = std::string("bt|") + mac_address;
+        active_link.link.linkType = LINK_TYPE_GREEN;
+        active_link.link.instrumentType = INSTRUMENT_BLUETOOTH;
+        copy_string(active_link.link.linkID, sizeof(active_link.link.linkID), make_link_id("bt", mac_address));
+        copy_string(active_link.link.devID, sizeof(active_link.link.devID), mac_address);
+        active_link.link.bluetoothDeviceInfo.major = UNCATEGORIZED;
+        active_link.link.bluetoothDeviceInfo.rssi.valid = false;
+        copy_string(active_link.link.bluetoothDeviceInfo.mac_address,
+                    sizeof(active_link.link.bluetoothDeviceInfo.mac_address),
+                    mac_address);
+        copy_string(active_link.link.bluetoothDeviceInfo.name,
+                    sizeof(active_link.link.bluetoothDeviceInfo.name),
+                    name);
+
+        comms_debug("publishing incoming bluetooth link: mac=%s name=%s", mac_address.c_str(), name.c_str());
+        publish_link(std::move(active_link));
+        return true;
+    }
+
+    bool publish_incoming_wifi_link(const std::string& interface_name,
+                                    const std::string& ip_address,
+                                    const std::string& mac_address) {
+        if (interface_name.empty() || ip_address.empty() || mac_address.empty()) {
+            comms_debug("incoming wifi link publish skipped: if=%s ip=%s mac=%s",
+                        interface_name.c_str(),
+                        ip_address.c_str(),
+                        mac_address.c_str());
+            return false;
+        }
+
+        ActiveLink active_link;
+        std::memset(&active_link.link, 0, sizeof(active_link.link));
+        active_link.key = std::string("wifi|") + mac_address;
+        active_link.link.linkType = LINK_TYPE_BLUE;
+        active_link.link.instrumentType = INSTRUMENT_WIFI;
+        copy_string(active_link.link.linkID, sizeof(active_link.link.linkID), make_link_id("wifi", mac_address));
+        copy_string(active_link.link.devID, sizeof(active_link.link.devID), mac_address);
+        active_link.link.wifiDeviceInfo.type = WIFI_ADAPTER;
+        active_link.link.wifiDeviceInfo.rssi.valid = false;
+        copy_string(active_link.link.wifiDeviceInfo.mac_address,
+                    sizeof(active_link.link.wifiDeviceInfo.mac_address),
+                    mac_address);
+        copy_string(active_link.link.wifiDeviceInfo.ssid,
+                    sizeof(active_link.link.wifiDeviceInfo.ssid),
+                    ip_address);
+
+        comms_debug("publishing incoming wifi link: if=%s ip=%s mac=%s",
+                    interface_name.c_str(),
+                    ip_address.c_str(),
+                    mac_address.c_str());
+        publish_link(std::move(active_link));
         return true;
     }
 
@@ -762,6 +952,7 @@ class CommsRuntime {
                 if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
                     continue;
                 }
+                comms_debug("udp server recvmsg failed: errno=%d", errno);
                 break;
             }
 
@@ -778,6 +969,25 @@ class CommsRuntime {
                     incoming_ifindex = packet_info_data->ipi_ifindex;
                     interface_name = interface_name_from_index(packet_info_data->ipi_ifindex);
                     break;
+                }
+            }
+
+            char remote_ip[INET_ADDRSTRLEN] = {0};
+            (void)inet_ntop(AF_INET, &remote.sin_addr, remote_ip, sizeof(remote_ip));
+            comms_debug("udp server got '%s' from %s:%u on if=%s",
+                        buffer.data(),
+                        remote_ip,
+                        (unsigned)ntohs(remote.sin_port),
+                        interface_name.c_str());
+
+            if (std::strcmp(buffer.data(), kHelloPayload) == 0) {
+                const std::string remote_mac = arp_mac_for_ip(interface_name, remote_ip);
+                if (!remote_mac.empty()) {
+                    (void)publish_incoming_wifi_link(interface_name, remote_ip, remote_mac);
+                } else {
+                    comms_debug("udp server could not resolve ARP for %s on if=%s",
+                                remote_ip,
+                                interface_name.c_str());
                 }
             }
 
@@ -810,6 +1020,7 @@ class CommsRuntime {
             }
 
             (void)sendmsg(socket_fd, &reply_message, 0);
+            comms_debug("udp server replied '%s'", reply.c_str());
         }
 
         close(socket_fd);
@@ -853,6 +1064,14 @@ class CommsRuntime {
             std::array<char, 512> buffer{};
             const ssize_t received = recv(client_fd, buffer.data(), buffer.size() - 1, 0);
             if (received > 0) {
+                char remote_address[18] = {0};
+                ba2str(&remote.l2_bdaddr, remote_address);
+                std::string remote_mac = normalize_mac(remote_address);
+
+                if (std::strcmp(buffer.data(), kHelloPayload) == 0) {
+                    (void)publish_incoming_bluetooth_link(remote_mac, "");
+                }
+
                 sockaddr_l2 local_socket{};
                 socklen_t local_len = sizeof(local_socket);
                 std::string local_mac;

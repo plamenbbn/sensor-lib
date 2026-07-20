@@ -40,10 +40,15 @@ static LinkResultRecord g_link_results[COMMS_MAX_LINKS * 4];
 static unsigned g_link_result_count = 0U;
 static volatile sig_atomic_t g_stop_requested = 0;
 static const unsigned g_nmcli_timeout_seconds = 15U;
+static const unsigned g_wifi_connect_attempts = 8U;
+static const unsigned g_wifi_connect_retry_delay_seconds = 3U;
 static const unsigned g_test_message_count = 3U;
 static const unsigned g_message_delay_seconds = 1U;
 static const unsigned g_recv_idle_limit = 4U;
 static const unsigned g_recv_timeout_ms = 1000U;
+static const unsigned g_connect_timeout_ms = 2000U;
+static const unsigned g_connect_attempts = 12U;
+static const unsigned g_connect_retry_delay_seconds = 1U;
 static const char* g_default_test_ssid = "sensor-lib-link-callback";
 static const char* g_default_test_password = "sensorlib123";
 
@@ -81,6 +86,15 @@ static void copy_string(char* const dst, const size_t dst_size, const char* cons
 static const char* getenv_or_default(const char* const name, const char* const fallback) {
     const char* const value = getenv(name);
     return ((value != NULL) && (value[0] != '\0')) ? value : fallback;
+}
+
+static bool env_flag_enabled(const char* const name) {
+    const char* const value = getenv(name);
+    return (value != NULL) && (value[0] != '\0') && (strcmp(value, "0") != 0);
+}
+
+static bool skip_wifi_mode_setup(void) {
+    return env_flag_enabled("SENSOR_LIB_LINK_CALLBACK_SKIP_WIFI_MODE");
 }
 
 static const char* instrument_name(const InstrumentType instrument_type) {
@@ -138,6 +152,7 @@ static bool run_timed_command(const char* const label, const char* const command
         return false;
     }
 
+    const bool prefer_sudo = (system("sudo -n true >/dev/null 2>&1") == 0);
     char temp_path[] = "/tmp/sensor-lib-link-callback.XXXXXX";
     const int temp_fd = mkstemp(temp_path);
     if (temp_fd >= 0) {
@@ -149,8 +164,9 @@ static bool run_timed_command(const char* const label, const char* const command
     char wrapped_command[2048];
     snprintf(wrapped_command,
              sizeof(wrapped_command),
-             "timeout %us /bin/bash -lc \"%s\"%s%s%s",
+             "timeout %us %s/bin/bash -lc \"%s\"%s%s%s",
              g_nmcli_timeout_seconds,
+             prefer_sudo ? "sudo -n " : "",
              command,
              temp_path[0] != '\0' ? " >" : "",
              temp_path[0] != '\0' ? temp_path : "",
@@ -194,6 +210,10 @@ static bool configure_wifi_mode(const HarnessWifiMode wifi_mode, WifiModeState* 
     memset(state, 0, sizeof(*state));
     state->mode = wifi_mode;
 
+    if (skip_wifi_mode_setup()) {
+        return true;
+    }
+
     if (!read_first_line("nmcli -t -f DEVICE,TYPE device status | awk -F: '$2==\"wifi\"{print $1; exit}'",
                          state->interface_name,
                          sizeof(state->interface_name))) {
@@ -209,16 +229,17 @@ static bool configure_wifi_mode(const HarnessWifiMode wifi_mode, WifiModeState* 
     if (wifi_mode == HARNESS_WIFI_MODE_CLIENT) {
         const char* const ssid = getenv_or_default("SENSOR_LIB_TEST_SSID", g_default_test_ssid);
         const char* const password = getenv_or_default("SENSOR_LIB_TEST_PASSWORD", g_default_test_password);
+        char rescan_command[1024];
 
         (void)run_timed_command("enable Wi-Fi radio", "nmcli radio wifi on", true);
         (void)run_timed_command("delete stale client profile", "nmcli connection delete sensor-lib-link-callback-client || true", true);
 
         char command[1024];
-        snprintf(command,
-                 sizeof(command),
+        snprintf(rescan_command,
+                 sizeof(rescan_command),
                  "nmcli device wifi rescan ifname '%s' || true",
                  state->interface_name);
-        (void)run_timed_command("rescan Wi-Fi", command, true);
+        (void)run_timed_command("rescan Wi-Fi", rescan_command, true);
 
         snprintf(command,
                  sizeof(command),
@@ -226,7 +247,25 @@ static bool configure_wifi_mode(const HarnessWifiMode wifi_mode, WifiModeState* 
                  ssid,
                  password,
                  state->interface_name);
-        if (!run_timed_command("connect to test hotspot", command, false)) {
+        bool connected = false;
+        for (unsigned attempt = 0U; attempt < g_wifi_connect_attempts; ++attempt) {
+            if (run_timed_command("connect to test hotspot", command, false)) {
+                connected = true;
+                break;
+            }
+
+            if ((attempt + 1U) < g_wifi_connect_attempts) {
+                fprintf(stderr,
+                        "[wifi-mode] connect to test hotspot: retrying (%u/%u)\n",
+                        attempt + 1U,
+                        g_wifi_connect_attempts);
+                fflush(stderr);
+                sleep(g_wifi_connect_retry_delay_seconds);
+                (void)run_timed_command("rescan Wi-Fi", rescan_command, true);
+            }
+        }
+
+        if (!connected) {
             return false;
         }
 
@@ -541,10 +580,34 @@ static void* link_message_worker(void* const opaque_args) {
         goto cleanup;
     }
 
-    (void)bratislavaConnTimeout(bsock, DEFAULT_CONN_TIMEOUT_MS);
+    (void)bratislavaConnTimeout(bsock, g_connect_timeout_ms);
     (void)bratislavaRecvTimeout(bsock, g_recv_timeout_ms);
 
-    if (bratislavaConn(bsock) != 0) {
+    bool connected = false;
+    int last_errno = 0;
+    for (unsigned attempt = 0U; attempt < g_connect_attempts; ++attempt) {
+        if (bratislavaConn(bsock) == 0) {
+            connected = true;
+            break;
+        }
+
+        last_errno = errno;
+        if ((attempt + 1U) < g_connect_attempts) {
+            fprintf(stderr,
+                    "Message test connect retry for link %s: attempt=%u/%u errno=%d\n",
+                    args->link.linkID,
+                    attempt + 1U,
+                    g_connect_attempts,
+                    last_errno);
+            fflush(stderr);
+            if (!g_stop_requested) {
+                sleep(g_connect_retry_delay_seconds);
+            }
+        }
+    }
+
+    if (!connected) {
+        errno = last_errno;
         fprintf(stderr, "Message test connect failed for link %s: errno=%d\n", args->link.linkID, errno);
         goto cleanup_socket;
     }
@@ -739,7 +802,8 @@ int run_link_callback_harness(const InstrumentAPI* const api,
         return 1;
     }
 
-    printf("Wi-Fi harness mode: %s\n", wifi_mode == HARNESS_WIFI_MODE_HOTSPOT ? "hotspot" : "client");
+    printf("Wi-Fi harness mode: %s\n",
+           skip_wifi_mode_setup() ? "skipped" : (wifi_mode == HARNESS_WIFI_MODE_HOTSPOT ? "hotspot" : "client"));
     LinkDiscoveredCallback callback = link_callback_logger;
     instrument_api_status_t status =
         api->registerCallback(INSTRUMENT_COMMS, LINK_DISCOVERED, (InstrumentInputType)&callback);
@@ -750,6 +814,8 @@ int run_link_callback_harness(const InstrumentAPI* const api,
     }
 
     unsigned iteration = 0U;
+    const bool skip_wifi_scan = env_flag_enabled("SENSOR_LIB_LINK_CALLBACK_SKIP_WIFI_SCAN");
+    const bool skip_bt_scan = env_flag_enabled("SENSOR_LIB_LINK_CALLBACK_SKIP_BT_SCAN");
     while (!g_stop_requested) {
         BluetoothAdapterInfoBase bt_adapters[BLUETOOTH_MAX_ADAPTERS];
         BluetoothDeviceInfoBase bt_devices[BLUETOOTH_MAX_DEVICES];
@@ -762,20 +828,25 @@ int run_link_callback_harness(const InstrumentAPI* const api,
 
         ++iteration;
 
-        status = api->instrumentAction(INSTRUMENT_BLUETOOTH_GET_ADAPTER_INFO, NULL, 0U, bt_adapters, &bt_adapter_count);
-        if ((status == INSTRUMENT_API_SUCCESS) && (bt_adapter_count > 0U)) {
-            status = api->instrumentAction(
-                INSTRUMENT_BLUETOOTH_DISCOVER_DEVICES, &bt_adapters[0], 1U, bt_devices, &bt_device_count);
-            if ((status != INSTRUMENT_API_SUCCESS) && (status != INSTRUMENT_API_NOT_SUPPORTED)) {
-                fprintf(stderr, "  Bluetooth discovery failed: %d\n", status);
+        if (!skip_bt_scan) {
+            status =
+                api->instrumentAction(INSTRUMENT_BLUETOOTH_GET_ADAPTER_INFO, NULL, 0U, bt_adapters, &bt_adapter_count);
+            if ((status == INSTRUMENT_API_SUCCESS) && (bt_adapter_count > 0U)) {
+                status = api->instrumentAction(
+                    INSTRUMENT_BLUETOOTH_DISCOVER_DEVICES, &bt_adapters[0], 1U, bt_devices, &bt_device_count);
+                if ((status != INSTRUMENT_API_SUCCESS) && (status != INSTRUMENT_API_NOT_SUPPORTED)) {
+                    fprintf(stderr, "  Bluetooth discovery failed: %d\n", status);
+                }
+            } else if (status != INSTRUMENT_API_NOT_SUPPORTED) {
+                fprintf(stderr, "  Bluetooth adapter query failed: %d\n", status);
             }
-        } else if (status != INSTRUMENT_API_NOT_SUPPORTED) {
-            fprintf(stderr, "  Bluetooth adapter query failed: %d\n", status);
         }
 
-        status = api->instrumentAction(INSTRUMENT_WIFI_DISCOVER_DEVICES, NULL, 0U, wf_devices, &wf_device_count);
-        if ((status != INSTRUMENT_API_SUCCESS) && (status != INSTRUMENT_API_NOT_SUPPORTED)) {
-            fprintf(stderr, "  Wi-Fi discovery failed: %d\n", status);
+        if (!skip_wifi_scan) {
+            status = api->instrumentAction(INSTRUMENT_WIFI_DISCOVER_DEVICES, NULL, 0U, wf_devices, &wf_device_count);
+            if ((status != INSTRUMENT_API_SUCCESS) && (status != INSTRUMENT_API_NOT_SUPPORTED)) {
+                fprintf(stderr, "  Wi-Fi discovery failed: %d\n", status);
+            }
         }
 
         status = api->instrumentAction(INSTRUMENT_COMMS_DISCOVER_BRATISLAVA_LINKS, NULL, 0U, links, &link_count);
@@ -785,13 +856,17 @@ int run_link_callback_harness(const InstrumentAPI* const api,
 
         printf("Iteration %u summary\n", iteration);
         printf("  Active links: %u\n", link_count);
-        if (bt_device_count == 0U) {
+        if (skip_bt_scan) {
+            printf("  [BT] scan skipped by SENSOR_LIB_LINK_CALLBACK_SKIP_BT_SCAN\n");
+        } else if (bt_device_count == 0U) {
             printf("  [BT] no devices discovered\n");
         } else {
             report_bluetooth_devices(bt_devices, bt_device_count);
         }
 
-        if (wf_device_count == 0U) {
+        if (skip_wifi_scan) {
+            printf("  [WF] scan skipped by SENSOR_LIB_LINK_CALLBACK_SKIP_WIFI_SCAN\n");
+        } else if (wf_device_count == 0U) {
             printf("  [WF] no devices discovered\n");
         } else {
             report_wifi_devices(wf_devices, wf_device_count);

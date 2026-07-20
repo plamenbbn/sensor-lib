@@ -2,6 +2,7 @@
 
 #include "bluetooth_typedef.h"
 
+#include <bluetooth/bluetooth.h>
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -239,6 +240,45 @@ static void append_known_devices(BluezScanEntry* const entries, uint32_t* const 
     parse_scan_output(output, entries, count);
 }
 
+static void append_hci_inquiry_devices(BluezScanEntry* const entries, uint32_t* const count) {
+    char output[BLUEZ_INFO_OUTPUT_MAX];
+    if (!read_command_output("hcitool inq 2>/dev/null", output, sizeof(output))) {
+        return;
+    }
+
+    char* buffer = strdup(output);
+    if (buffer == NULL) {
+        return;
+    }
+
+    char* saveptr = NULL;
+    for (char* line = strtok_r(buffer, "\n", &saveptr); line != NULL; line = strtok_r(NULL, "\n", &saveptr)) {
+        trim_trailing_whitespace(line);
+        while ((*line != '\0') && isspace((unsigned char)*line)) {
+            ++line;
+        }
+
+        char mac[18];
+        memset(mac, 0, sizeof(mac));
+        strncpy(mac, line, sizeof(mac) - 1U);
+        mac[17] = '\0';
+        if (!looks_like_mac(mac)) {
+            continue;
+        }
+
+        BluezScanEntry parsed;
+        memset(&parsed, 0, sizeof(parsed));
+        copy_string(parsed.mac_address, sizeof(parsed.mac_address), mac);
+
+        BluezScanEntry* slot = NULL;
+        if (!find_or_add_entry(entries, count, &parsed, &slot)) {
+            continue;
+        }
+    }
+
+    free(buffer);
+}
+
 static void parse_class_property(const char* const info_output, BluetoothDeviceInfoBase* const device) {
     const char* class_line = strstr(info_output, "\tClass:");
     if (class_line == NULL) {
@@ -327,6 +367,7 @@ instrument_api_status_t bluetooth_discover_devices_backend(const InstrumentInput
     uint32_t discovered_count = 0U;
     parse_scan_output(scan_output, discovered, &discovered_count);
     append_known_devices(discovered, &discovered_count);
+    append_hci_inquiry_devices(discovered, &discovered_count);
 
     BluetoothDeviceInfoBase* const devices = (BluetoothDeviceInfoBase*)output_data;
     for (uint32_t i = 0U; i < discovered_count; ++i) {
